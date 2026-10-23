@@ -383,6 +383,75 @@ your own account's user id, username, and display name.
 
 ---
 
+## Shared backend: one Telegram connection for many agents
+
+Telegram allows exactly one MTProto client per auth key. If two processes use
+the same stored session concurrently, Telegram revokes the key
+(`AUTH_KEY_DUPLICATED`) and you have to log in again. That is exactly what
+happens when several agent sessions (or hosts) each spawn their own
+`codex-telegram serve`.
+
+To prevent this, `codex-telegram serve` is a thin stdio proxy by default:
+
+- It holds **no** Telegram connection. It relays JSON-RPC from the MCP host to
+  a shared backend over a unix socket (created `0600` inside a `0700`
+  `run/` dir next to the session file).
+- The shared backend (`codex-telegram backend`) owns the **only** Telethon
+  client. It is started on demand by the first proxy that needs it and is
+  single-instance via an `flock` on `run/backend.lock` — concurrent starts
+  collapse to one process, extra backends exit immediately.
+- If the backend dies, the next request from any proxy restarts it (stale
+  sockets are cleaned up by the new lock holder, so clients never overlap).
+- At startup each proxy also terminates leftover *legacy* per-agent
+  `codex-telegram serve` processes from before this design, matched
+  structurally against `/proc/<pid>/cmdline` and the process environment so it
+  can never hit an unrelated process, another proxy, or a serve bound to a
+  different config dir. Set `CODEX_TELEGRAM_LEGACY_CLEANUP=0` to disable the
+  sweep.
+
+Nothing changes in how you register the server: clients still launch
+`codex-telegram serve` over stdio.
+
+Environment variables (all optional):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `CODEX_TELEGRAM_SHARED_BACKEND` | `1` | Set to `0` to run `serve` as a direct stdio server with its own Telegram client (old behavior). Only safe when exactly one agent host uses the session. `TELEGRAM_MCP_SHARED_BACKEND` is an accepted alias. |
+| `CODEX_TELEGRAM_BACKEND_SOCK` | `<config dir>/run/backend.sock` | Unix socket the backend listens on. |
+| `CODEX_TELEGRAM_BACKEND_LOCK` | `<config dir>/run/backend.lock` | Single-instance lock file; holds the backend pid. |
+| `CODEX_TELEGRAM_BACKEND_LOG` | `<config dir>/run/backend.log` | Backend stdout/stderr log. |
+| `CODEX_TELEGRAM_BACKEND_START_TIMEOUT` | `30` | Seconds a proxy waits for the backend to come up before failing the request. |
+| `CODEX_TELEGRAM_PROXY_TIMEOUT` | `600` | Per-request timeout (seconds) between proxy and backend. |
+| `CODEX_TELEGRAM_LEGACY_CLEANUP` | `1` | Set to `0` to skip the legacy-serve sweep at proxy startup. |
+
+The backend inherits the environment (config dir, master key, API
+credentials) of whichever proxy starts it, so give every host the same
+`CODEX_TELEGRAM_*` configuration.
+
+### Troubleshooting the shared backend
+
+- **Restart the backend**: kill the pid stored in the lock file; the next
+  tool call respawns it automatically.
+
+  ```bash
+  kill "$(cat ~/.config/codex-telegram/run/backend.lock)"
+  ```
+
+- **Verify there is exactly one backend / Telegram connection**:
+
+  ```bash
+  cat ~/.config/codex-telegram/run/backend.lock   # backend pid
+  pgrep -af 'codex_telegram backend'              # must list exactly one process
+  ss -xlp | grep backend.sock                     # exactly one listener
+  ```
+
+- **Backend fails to start**: the proxy reports
+  `telegram backend did not start within 30s; check .../run/backend.log`.
+  Read that log — typical causes are a missing session (run `login`) or a
+  blocked MTProto connection (see the MTProxy section).
+
+---
+
 ## Using with Agent Plugins clients
 
 The installable package is the `telegram/` directory. It ships two manifest
@@ -551,6 +620,15 @@ server cannot connect, route through an MTProxy by setting
 command and the MCP server. Keep the secret out of committed files. For other
 proxy types (SOCKS5, HTTP), see the
 [Telethon proxy docs](https://docs.telethon.dev/en/stable/basic/signing-in.html#signing-in-behind-a-proxy).
+
+### `AUTH_KEY_DUPLICATED` or timeouts when several agents are connected
+
+Two MTProto clients used the same session concurrently and Telegram revoked
+the auth key. Current versions prevent this: `serve` proxies every host to one
+shared backend (see the shared backend section above). If you hit this error,
+make sure no host sets `CODEX_TELEGRAM_SHARED_BACKEND=0` while others use the
+same session, stop any pre-shared-backend `codex-telegram serve` processes,
+then re-run `login` once to create a fresh session.
 
 ### `FLOOD_WAIT_X`
 
