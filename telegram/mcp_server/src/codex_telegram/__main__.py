@@ -3,10 +3,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
 
 from .auth import login_interactive, whoami_interactive
+from .backend import run_backend
 from .server import run_server
 from .session_store import clear_session, describe_storage
+from .stdio_proxy import run_proxy, shared_backend_enabled
 
 
 def _redact_phone(phone: str | None) -> str | None:
@@ -25,7 +28,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser("serve", help="Run the MCP server over stdio.")
+    subparsers.add_parser(
+        "serve",
+        help=(
+            "Run the MCP server over stdio. By default this is a thin proxy to "
+            "the shared single-instance backend; set CODEX_TELEGRAM_SHARED_BACKEND=0 "
+            "for the legacy direct mode with its own Telegram client."
+        ),
+    )
+
+    subparsers.add_parser(
+        "backend",
+        help=(
+            "Run the shared single-instance backend: streamable HTTP on a 0600 "
+            "unix socket, flock-guarded so only one Telegram client ever exists."
+        ),
+    )
 
     login = subparsers.add_parser("login", help="Authenticate a Telegram account.")
     login.add_argument("--api-id", type=int, default=None)
@@ -45,8 +63,14 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.command == "serve":
-        run_server()
+        if shared_backend_enabled():
+            run_proxy()
+        else:
+            run_server()
         return
+
+    if args.command == "backend":
+        sys.exit(run_backend())
 
     if args.command == "login":
         result = asyncio.run(
