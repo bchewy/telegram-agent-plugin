@@ -8,7 +8,7 @@ import signal
 
 from telethon import functions
 
-from ..client import get_client, with_flood_wait
+from ..client import get_client, upload_with_retry, with_flood_wait
 from ..helpers import (
     ensure_download_dir,
     message_to_dict,
@@ -165,13 +165,18 @@ def register(mcp) -> None:
             file_path,
             allow_arbitrary_path=allow_arbitrary_path,
         )
-        message = await client.send_file(
-            entity,
-            upload_path,
-            caption=caption,
-            reply_to=reply_to,
-            silent=silent,
-            schedule=parse_datetime(schedule_at),
+        message = await upload_with_retry(
+            lambda c: c.send_file(
+                entity,
+                upload_path,
+                caption=caption,
+                reply_to=reply_to,
+                silent=silent,
+                schedule=parse_datetime(schedule_at),
+            ),
+            file_path=upload_path,
+            tool_name="send_photo",
+            client=client,
         )
         payload = message_to_dict(message)
         if warning:
@@ -197,14 +202,19 @@ def register(mcp) -> None:
             file_path,
             allow_arbitrary_path=allow_arbitrary_path,
         )
-        message = await client.send_file(
-            entity,
-            upload_path,
-            caption=caption,
-            reply_to=reply_to,
-            force_document=force_document,
-            silent=silent,
-            schedule=parse_datetime(schedule_at),
+        message = await upload_with_retry(
+            lambda c: c.send_file(
+                entity,
+                upload_path,
+                caption=caption,
+                reply_to=reply_to,
+                force_document=force_document,
+                silent=silent,
+                schedule=parse_datetime(schedule_at),
+            ),
+            file_path=upload_path,
+            tool_name="send_document",
+            client=client,
         )
         payload = message_to_dict(message)
         if warning:
@@ -229,14 +239,19 @@ def register(mcp) -> None:
             file_path,
             allow_arbitrary_path=allow_arbitrary_path,
         )
-        message = await client.send_file(
-            entity,
-            upload_path,
-            caption=caption,
-            reply_to=reply_to,
-            voice_note=True,
-            silent=silent,
-            schedule=parse_datetime(schedule_at),
+        message = await upload_with_retry(
+            lambda c: c.send_file(
+                entity,
+                upload_path,
+                caption=caption,
+                reply_to=reply_to,
+                voice_note=True,
+                silent=silent,
+                schedule=parse_datetime(schedule_at),
+            ),
+            file_path=upload_path,
+            tool_name="send_voice",
+            client=client,
         )
         payload = message_to_dict(message)
         if warning:
@@ -262,14 +277,19 @@ def register(mcp) -> None:
             file_path,
             allow_arbitrary_path=allow_arbitrary_path,
         )
-        message = await client.send_file(
-            entity,
-            upload_path,
-            caption=caption,
-            reply_to=reply_to,
-            supports_streaming=supports_streaming,
-            silent=silent,
-            schedule=parse_datetime(schedule_at),
+        message = await upload_with_retry(
+            lambda c: c.send_file(
+                entity,
+                upload_path,
+                caption=caption,
+                reply_to=reply_to,
+                supports_streaming=supports_streaming,
+                silent=silent,
+                schedule=parse_datetime(schedule_at),
+            ),
+            file_path=upload_path,
+            tool_name="send_video",
+            client=client,
         )
         payload = message_to_dict(message)
         if warning:
@@ -293,12 +313,17 @@ def register(mcp) -> None:
             file_path,
             allow_arbitrary_path=allow_arbitrary_path,
         )
-        message = await client.send_file(
-            entity,
-            upload_path,
-            reply_to=reply_to,
-            silent=silent,
-            schedule=parse_datetime(schedule_at),
+        message = await upload_with_retry(
+            lambda c: c.send_file(
+                entity,
+                upload_path,
+                reply_to=reply_to,
+                silent=silent,
+                schedule=parse_datetime(schedule_at),
+            ),
+            file_path=upload_path,
+            tool_name="send_sticker",
+            client=client,
         )
         payload = message_to_dict(message)
         if warning:
@@ -323,13 +348,18 @@ def register(mcp) -> None:
             file_path,
             allow_arbitrary_path=allow_arbitrary_path,
         )
-        message = await client.send_file(
-            entity,
-            upload_path,
-            caption=caption,
-            reply_to=reply_to,
-            silent=silent,
-            schedule=parse_datetime(schedule_at),
+        message = await upload_with_retry(
+            lambda c: c.send_file(
+                entity,
+                upload_path,
+                caption=caption,
+                reply_to=reply_to,
+                silent=silent,
+                schedule=parse_datetime(schedule_at),
+            ),
+            file_path=upload_path,
+            tool_name="send_animation",
+            client=client,
         )
         payload = message_to_dict(message)
         if warning:
@@ -390,8 +420,16 @@ def register(mcp) -> None:
             file_path,
             allow_arbitrary_path=allow_arbitrary_path,
         )
-        uploaded = await client.upload_file(upload_path)
-        result = await client(functions.photos.UploadProfilePhotoRequest(file=uploaded))
+        async def _upload_profile_photo(c):
+            uploaded = await c.upload_file(upload_path)
+            return await c(functions.photos.UploadProfilePhotoRequest(file=uploaded))
+
+        result = await upload_with_retry(
+            _upload_profile_photo,
+            file_path=upload_path,
+            tool_name="set_profile_photo",
+            client=client,
+        )
         photo = result.photo if hasattr(result, "photo") else None
         payload = {
             "updated": True,

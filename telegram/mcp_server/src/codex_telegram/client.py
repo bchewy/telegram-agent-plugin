@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 import functools
+from pathlib import Path
 import time
 from typing import ParamSpec, TypeVar
 
@@ -31,6 +32,79 @@ DEFAULT_TAKEOUT_KWARGS = {
     "megagroups": True,
     "channels": True,
 }
+
+
+# Media uploads over flaky links (observed with MTProxy) can drop mid-transfer
+# with BrokenPipe/ConnectionReset, after which Telethon reconnect-loops and the
+# original request never resolves — the MCP call then hangs until the client
+# timeout. Retry the whole upload a few times on a fresh connection and fail
+# fast with a clear error once retries are exhausted.
+UPLOAD_ATTEMPTS = 3
+UPLOAD_RETRY_BACKOFF_SECONDS = (2.0, 5.0)
+UPLOAD_BASE_TIMEOUT_SECONDS = 90.0
+UPLOAD_MIN_BYTES_PER_SECOND = 64 * 1024
+
+
+class TelegramUploadError(RuntimeError):
+    """Raised when a media upload keeps failing on connection errors.
+
+    Subclasses RuntimeError so FastMCP stringifies it like other tool errors;
+    the message carries attempt/file details so MCP callers can tell a flaky
+    transfer from a bad request.
+    """
+
+    def __init__(self, *, tool_name: str, file_path: Path, attempts: int, last_error: BaseException):
+        self.tool_name = tool_name
+        self.attempts = attempts
+        super().__init__(
+            f"{tool_name}: upload of {file_path.name} failed after {attempts} attempts "
+            f"({type(last_error).__name__}: {last_error}). The Telegram connection "
+            "dropped mid-transfer each time; check the network/proxy and retry."
+        )
+
+
+def _upload_timeout_seconds(file_path: Path) -> float:
+    """Per-attempt stall timeout, scaled so large files on slow links still fit."""
+    size = file_path.stat().st_size
+    return UPLOAD_BASE_TIMEOUT_SECONDS + size / UPLOAD_MIN_BYTES_PER_SECOND
+
+
+async def upload_with_retry(
+    do_upload: Callable[[TelegramClient], Awaitable[R]],
+    *,
+    file_path: Path,
+    tool_name: str,
+    client: TelegramClient | None = None,
+) -> R:
+    """Run ``do_upload(client)`` with retries on connection drops and stalls.
+
+    Each failed attempt discards the shared client so the next attempt starts
+    from a fresh connection instead of a reconnect-looping one. Non-connection
+    errors (FloodWait, bad arguments, ...) propagate immediately.
+    """
+    timeout = _upload_timeout_seconds(file_path)
+    last_error: BaseException | None = None
+    for attempt in range(1, UPLOAD_ATTEMPTS + 1):
+        if client is None:
+            client = await get_client()
+        try:
+            return await asyncio.wait_for(do_upload(client), timeout=timeout)
+        except (ConnectionError, TimeoutError) as exc:
+            last_error = exc
+            client = None
+            await _discard_client()
+            if attempt < UPLOAD_ATTEMPTS:
+                backoff = UPLOAD_RETRY_BACKOFF_SECONDS[
+                    min(attempt - 1, len(UPLOAD_RETRY_BACKOFF_SECONDS) - 1)
+                ]
+                await asyncio.sleep(backoff)
+    assert last_error is not None
+    raise TelegramUploadError(
+        tool_name=tool_name,
+        file_path=file_path,
+        attempts=UPLOAD_ATTEMPTS,
+        last_error=last_error,
+    ) from last_error
 
 
 class TelegramFloodWaitError(RuntimeError):
