@@ -29,7 +29,7 @@
       ],
       "cwd": "./",
       "startup_timeout_sec": 20,
-      "tool_timeout_sec": 90
+      "tool_timeout_sec": 600
     }
   }
 }
