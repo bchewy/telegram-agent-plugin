@@ -29,6 +29,7 @@ def _isolate_telegram_runtime(monkeypatch):
     client_mod._client = None
     client_mod._client_unrecoverable = False
     client_mod._last_reset_monotonic = 0.0
+    client_mod._debounced_generation = None
     client_mod._reset_history.clear()
     client_mod._last_client_verify_monotonic = 0.0
     INFLIGHT.clear()

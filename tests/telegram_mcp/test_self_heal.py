@@ -539,27 +539,52 @@ def test_repeated_resets_escalate_instead_of_looping(monkeypatch):
     assert "did not stick" in reasons[-1]
 
 
+async def test_debounce_does_not_spare_a_client_connected_after_the_reset(monkeypatch):
+    _arm(monkeypatch, debounce=30.0)
+    first = _Client()
+    first.connected = True
+    client_mod._client = first
+    assert await client_mod.force_reset_client(reason="storm") is True
+    assert first.disconnects == 1
+
+    # Same object put back is the generation we just retired.
+    client_mod._client = first
+    first.connected = True
+    assert await client_mod.force_reset_client(reason="again") is False
+    assert first.disconnects == 1
+
+    second = _Client()
+    second.connected = True
+    client_mod._client = second
+    assert await client_mod.force_reset_client(reason="new client wedged") is True
+    assert second.disconnects == 1
+    assert client_mod.current_client() is None
+
+
 def test_reap_kills_only_orphaned_proxies(monkeypatch, tmp_path):
     killed = []
     dropped = []
     monkeypatch.setenv("CODEX_TELEGRAM_CONFIG_DIR", str(tmp_path))
-    # 10: orphaned serve. 20: serve whose parent is alive. 77: pid reused by
-    # something that is not a serve and has been reparented to init.
-    monkeypatch.setattr(legacy_serve, "registered_proxy_pids", lambda: {10, 20, 77, os.getpid()})
+    # 10: orphaned serve. 11: orphan that opted out. 20: serve whose parent
+    # is alive. 77: pid reused by something that is not a serve.
+    monkeypatch.setattr(
+        legacy_serve, "registered_proxy_pids", lambda: {10, 11, 20, 77, os.getpid()}
+    )
     monkeypatch.setattr(legacy_serve, "_self_and_ancestors", lambda: {os.getpid()})
     monkeypatch.setattr(
         legacy_serve,
         "_parent_pid",
-        lambda pid: {10: 1, 20: 50, 77: 1, os.getpid(): 49}[pid],
+        lambda pid: {10: 1, 11: 1, 20: 50, 77: 1, os.getpid(): 49}[pid],
     )
     monkeypatch.setattr(legacy_serve, "_pid_is_live", lambda pid: pid == 50)
 
     def cmdline(pid):
-        if pid in (10, 20):
+        if pid in (10, 11, 20):
             return ["python", "-m", "codex_telegram", "serve"]
         return ["python", "/usr/bin/unrelated-daemon"]
 
     monkeypatch.setattr(legacy_serve, "_read_cmdline", cmdline)
+    monkeypatch.setattr(legacy_serve, "_process_allows_orphan", lambda pid: pid == 11)
     monkeypatch.setattr(legacy_serve.os, "kill", lambda pid, _sig: killed.append(pid))
     monkeypatch.setattr(
         legacy_serve.Path,
@@ -568,6 +593,7 @@ def test_reap_kills_only_orphaned_proxies(monkeypatch, tmp_path):
     )
 
     assert legacy_serve.reap_orphaned_proxies() == [10]
+    assert 11 not in killed
     assert 20 not in killed
     assert 77 not in killed
     assert os.getpid() not in killed
@@ -631,6 +657,19 @@ def test_terminate_sigkills_a_backend_that_ignores_sigterm(monkeypatch, tmp_path
     assert signals == [signal.SIGTERM, signal.SIGKILL]
 
 
+def test_terminate_does_not_kill_a_replacement_backend(monkeypatch, tmp_path):
+    lock = tmp_path / "backend.lock"
+    lock.write_text("200\n")
+    signals = []
+    monkeypatch.setattr(supervision, "pid_alive", lambda _pid: True)
+    monkeypatch.setattr(supervision, "is_backend_process", lambda _pid: True)
+    monkeypatch.setattr(supervision.os, "kill", lambda pid, sig: signals.append((pid, sig)))
+    # The request was in flight against 100. 200 is the backend a peer already
+    # started. Signaling it would wedge the session we just recovered.
+    assert supervision.terminate_locked_backend(lock, expected_pid=100) is False
+    assert signals == []
+
+
 def test_is_backend_process_matches_the_module_invocation_only():
     assert supervision._BACKEND_ARGV_TAIL == (b"-m", b"codex_telegram", b"backend")
     # The pytest process is not a backend, whatever its command line contains.
@@ -649,7 +688,7 @@ async def test_proxy_timeout_restarts_the_backend_without_retrying_the_call(tmp_
 
     relay.client.post = post
 
-    async def restart(self):
+    async def restart(self, expected_pid=None):
         calls.append("restart")
 
     monkeypatch.setattr(Relay, "_restart_unresponsive_backend", restart)
@@ -665,7 +704,7 @@ async def test_restart_spawns_only_after_the_old_backend_is_stopped(tmp_path, mo
     relay = Relay()
     order = []
 
-    def kill(path):
+    def kill(path, expected_pid=None):
         order.append("kill")
         raise RuntimeError("pid is not a codex_telegram backend")
 

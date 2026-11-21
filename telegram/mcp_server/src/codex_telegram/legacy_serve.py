@@ -167,6 +167,9 @@ def parent_gone(original_ppid: int) -> bool:
     this process was still importing — ``serve`` is not a daemon, so that is
     an orphan too. Set ``CODEX_TELEGRAM_ALLOW_ORPHAN=1`` to keep a serve that
     was started detached on purpose.
+
+    Without ``/proc`` (macOS), a parent whose pid still matches is treated as
+    alive. Zombie detection needs procfs; stdin EOF still ends the serve.
     """
     if os.getenv("CODEX_TELEGRAM_ALLOW_ORPHAN", "").strip().lower() in {
         "1",
@@ -213,6 +216,9 @@ def reap_orphaned_proxies(*, log=None) -> list[int]:
         if not is_direct_serve_cmdline(_read_cmdline(pid)):
             (proxy_registry_dir() / str(pid)).unlink(missing_ok=True)
             continue
+        # The opt-out belongs to the process we would signal, not to us.
+        if _process_allows_orphan(pid):
+            continue
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError:
@@ -221,6 +227,20 @@ def reap_orphaned_proxies(*, log=None) -> list[int]:
         if log is not None:
             log(f"stopped orphaned serve pid={pid}")
     return killed
+
+
+def _process_allows_orphan(pid: int) -> bool:
+    """True when that process was started with ``CODEX_TELEGRAM_ALLOW_ORPHAN``."""
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return False
+    prefix = b"CODEX_TELEGRAM_ALLOW_ORPHAN="
+    for entry in raw.split(b"\x00"):
+        if entry.startswith(prefix):
+            value = entry[len(prefix):].decode("utf-8", "replace").strip().lower()
+            return value in {"1", "true", "yes", "on"}
+    return False
 
 
 def registered_proxy_pids() -> set[int]:

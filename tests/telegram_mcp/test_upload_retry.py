@@ -157,6 +157,7 @@ def test_upload_timeout_scales_with_file_size(tmp_path):
 async def test_total_budget_returns_error_before_host_timeout(upload_file, retry_env, monkeypatch):
     """A dead proxy must surface TelegramUploadError inside the host MCP wait."""
     monkeypatch.setattr(client_mod, "UPLOAD_TOTAL_BUDGET_SECONDS", 0.05)
+    monkeypatch.setattr(client_mod, "DISCONNECT_TIMEOUT_SECONDS", 0.0)
     monkeypatch.setattr(client_mod, "_upload_timeout_seconds", lambda _path: 30.0)
     monkeypatch.setattr(client_mod, "UPLOAD_ATTEMPTS", 5)
     attempts = []

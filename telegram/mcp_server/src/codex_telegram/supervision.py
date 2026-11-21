@@ -58,6 +58,14 @@ def is_backend_process(pid: int) -> bool:
     return len(parts) >= 2 and parts[-1] == b"backend" and parts[-2].endswith(b"codex-telegram")
 
 
+def locked_backend_pid(lock_path: Path) -> int | None:
+    """Pid currently holding the backend lock, if that process is still alive."""
+    pid = _read_lock_pid(lock_path)
+    if pid is None or pid <= 0 or not pid_alive(pid):
+        return None
+    return pid
+
+
 def _wait_until_dead(pid: int, grace: float) -> bool:
     deadline = time.monotonic() + grace
     while time.monotonic() < deadline:
@@ -67,15 +75,24 @@ def _wait_until_dead(pid: int, grace: float) -> bool:
     return not pid_alive(pid)
 
 
-def terminate_locked_backend(lock_path: Path, *, grace: float = 8.0) -> bool:
+def terminate_locked_backend(
+    lock_path: Path,
+    *,
+    grace: float = 8.0,
+    expected_pid: int | None = None,
+) -> bool:
     """SIGTERM the backend holding ``lock_path``, SIGKILL if it survives.
 
-    Returns False when no backend was running. Raises if the pid in the lock
-    file is not our backend (we will not signal an unrelated process) or if
-    it is still alive after SIGKILL. Returns only once the old process can no
-    longer hold an MTProto session.
+    Returns False when no backend was running, or when ``expected_pid`` is set
+    and the lock now names a different process (a peer proxy already replaced
+    the one this request was talking to). Raises if the pid in the lock file
+    is not our backend (we will not signal an unrelated process) or if it is
+    still alive after SIGKILL. Returns only once the old process can no longer
+    hold an MTProto session.
     """
     pid = _read_lock_pid(lock_path)
+    if expected_pid is not None and pid != expected_pid:
+        return False
     if pid is None or pid <= 0 or not pid_alive(pid):
         return False
     if not is_backend_process(pid):

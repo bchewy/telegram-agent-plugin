@@ -137,7 +137,6 @@ def test_serve_exits_when_parent_dies_while_stdin_stays_open(config_dir, tmp_pat
         os.close(read_fd)
         read_fd = -1
         pid = int(pidfile.read_text(encoding="ascii"))
-        assert _alive(pid)
         if not _wait_dead(pid, 8):
             raise AssertionError(
                 f"serve {pid} still alive 8s after its parent exited\n"

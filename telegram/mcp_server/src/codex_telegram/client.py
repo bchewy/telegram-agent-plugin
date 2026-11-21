@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 import functools
 import logging
+import math
 import os
 from pathlib import Path
 import sys
@@ -30,20 +31,30 @@ _last_client_verify_monotonic = 0.0
 # two MTProto sessions on the same auth key, which Telegram revokes.
 _client_unrecoverable = False
 _last_reset_monotonic = 0.0
+# id() of the client the last reset retired. The debounce covers that
+# generation only, so a client connected after the reset is not suppressed.
+_debounced_generation: int | None = None
 _reset_history: list[float] = []
 
 CONNECTION_VERIFY_INTERVAL_SECONDS = 30.0
 CONNECTION_VERIFY_TIMEOUT_SECONDS = 5.0
 
 
-def _float_env(name: str, default: float) -> float:
+def _float_env(name: str, default: float, *, allow_zero: bool = False) -> float:
     raw = os.getenv(name)
     if not raw:
         return default
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
         return default
+    if (
+        not math.isfinite(value)
+        or value < 0
+        or (value == 0 and not allow_zero)
+    ):
+        return default
+    return value
 
 
 # Telethon's connect() awaits an InvokeWithLayer RPC with no timeout of its
@@ -60,7 +71,7 @@ DISCONNECT_TIMEOUT_SECONDS = _float_env("CODEX_TELEGRAM_DISCONNECT_TIMEOUT", 8.0
 RESET_LOCK_TIMEOUT_SECONDS = _float_env("CODEX_TELEGRAM_RESET_LOCK_TIMEOUT", 45.0)
 # Collapse the storm handler, the watchdog and a tool timeout firing together
 # into a single reset.
-RESET_DEBOUNCE_SECONDS = _float_env("CODEX_TELEGRAM_RESET_DEBOUNCE", 20.0)
+RESET_DEBOUNCE_SECONDS = _float_env("CODEX_TELEGRAM_RESET_DEBOUNCE", 20.0, allow_zero=True)
 # In-process resets that keep wedging mean the process itself is poisoned
 # (offset corrected, but the sender loops or the proxy socket are not). Die
 # and let a proxy respawn one clean backend.
@@ -182,14 +193,17 @@ async def upload_with_retry(
             if remaining <= 0:
                 last_error = TimeoutError("upload budget exhausted during reconnect")
                 break
-        # Keep the disconnect bound in reserve once the budget is large
-        # enough to matter, so teardown still fits inside it. A budget
-        # smaller than that bound (tests) is spent on the transfer itself.
-        reserve = DISCONNECT_TIMEOUT_SECONDS if remaining > DISCONNECT_TIMEOUT_SECONDS else 0.0
-        transfer = min(per_attempt, remaining - reserve)
-        if transfer <= 0:
-            last_error = TimeoutError("upload budget exhausted")
+        # A failed attempt then waits out disconnect, which is up to
+        # DISCONNECT_TIMEOUT_SECONDS. Starting a transfer that leaves less
+        # than that pushes TelegramUploadError past the budget.
+        if (
+            DISCONNECT_TIMEOUT_SECONDS > 0
+            and remaining <= DISCONNECT_TIMEOUT_SECONDS
+        ):
+            if last_error is None:
+                last_error = TimeoutError("upload budget exhausted")
             break
+        transfer = min(per_attempt, remaining - DISCONNECT_TIMEOUT_SECONDS)
         attempts_used = attempt
         try:
             return await asyncio.wait_for(do_upload(client), timeout=transfer)
@@ -380,22 +394,28 @@ async def force_reset_client(*, reason: str) -> bool:
 
     The fresh client has a new ``MTProtoState`` with ``time_offset == 0``,
     which is the only thing that ends an ignore-storm: Telethon's own
-    reconnect keeps the bad offset. Returns False when a reset just happened
-    and this call is inside the debounce window.
+    reconnect keeps the bad offset. Returns False when this same client was
+    just reset (or nothing is connected) and the call is inside the debounce
+    window. A client connected after that reset is not covered by it.
 
     Takes ``_client_lock`` so a reset can never overlap a rebuild. Two live
     clients on one session is the failure this whole process exists to avoid.
     """
-    global _last_reset_monotonic
+    global _last_reset_monotonic, _debounced_generation
 
     if _client_unrecoverable:
         _escalate(f"refusing a second MTProto client after a stuck shutdown ({reason})")
         raise ConnectionError("Telegram client could not be shut down; the backend is restarting.")
 
     now = time.monotonic()
-    if now - _last_reset_monotonic < RESET_DEBOUNCE_SECONDS:
+    current = _client
+    if now - _last_reset_monotonic < RESET_DEBOUNCE_SECONDS and (
+        current is None or id(current) == _debounced_generation
+    ):
         return False
     _last_reset_monotonic = now
+    if current is not None:
+        _debounced_generation = id(current)
 
     cutoff = now - RESET_ESCALATE_WINDOW_SECONDS
     _reset_history.append(now)
@@ -527,7 +547,9 @@ async def get_client() -> TelegramClient:
 async def _connect_and_check(client: TelegramClient) -> None:
     await client.connect()
     if not await client.is_user_authorized():
-        await _shutdown_client(client, context="unauthorized session")
+        # get_client shuts the unpublished client down once, on the way out.
+        # Disconnecting here as well hides the login error if that second
+        # shutdown times out and escalates.
         raise RuntimeError(
             "Stored Telegram session is no longer authorized. "
             "Re-run `python -m codex_telegram login`."

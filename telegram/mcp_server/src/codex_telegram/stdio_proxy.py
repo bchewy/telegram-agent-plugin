@@ -28,7 +28,7 @@ import httpx
 from . import limits
 from .legacy_serve import kill_legacy_serves, parent_gone, reap_orphaned_proxies, register_proxy
 from .runtime_paths import backend_lock_path, backend_log_path, backend_socket_path, config_dir
-from .supervision import terminate_locked_backend
+from .supervision import locked_backend_pid, terminate_locked_backend
 
 SHARED_BACKEND_ENV_VARS = (
     "CODEX_TELEGRAM_SHARED_BACKEND",
@@ -178,9 +178,14 @@ class Relay:
         FileNotFoundError,
     )
 
-    async def _post_with_retry(self, raw: str) -> httpx.Response:
+    async def _post_with_retry(self, raw: str, observed: list[int]) -> httpx.Response:
         for attempt in range(2):
             try:
+                # The pid this POST is about to talk to. A timeout later may
+                # only kill this pid: a peer proxy may already have replaced it.
+                pid = await asyncio.to_thread(locked_backend_pid, backend_lock_path())
+                if pid is not None:
+                    observed.append(pid)
                 return await self.client.post(MCP_URL, content=raw.encode("utf-8"), headers=HEADERS)
             except self._RETRYABLE_ERRORS:
                 if attempt:
@@ -189,16 +194,22 @@ class Relay:
                 await self.ensure_backend()
         raise AssertionError("unreachable")
 
-    async def _restart_unresponsive_backend(self) -> None:
+    async def _restart_unresponsive_backend(self, expected_pid: int | None = None) -> None:
         """Kill the backend and start a new one, only after the old one is dead.
 
         A timed-out call is not retried: the request may already have reached
         Telegram (a send), and a second attempt would duplicate it. The next
-        call from the host lands on the fresh backend.
+        call from the host lands on the fresh backend. ``expected_pid`` is the
+        process this request was waiting on; if the lock names someone else,
+        that replacement is left alone.
         """
         _err("backend did not answer within the deadline; restarting it")
         try:
-            await asyncio.to_thread(terminate_locked_backend, backend_lock_path())
+            await asyncio.to_thread(
+                terminate_locked_backend,
+                backend_lock_path(),
+                expected_pid=expected_pid,
+            )
         except Exception as exc:
             _err(f"could not stop the wedged backend: {exc!r}")
             return
@@ -208,13 +219,15 @@ class Relay:
             _err(f"backend did not come back after restart: {exc!r}")
 
     async def post(self, raw: str) -> httpx.Response:
+        observed: list[int] = []
         try:
             return await asyncio.wait_for(
-                self._post_with_retry(raw),
+                self._post_with_retry(raw, observed),
                 timeout=self.response_deadline,
             )
         except (TimeoutError, httpx.TimeoutException):
-            await self._restart_unresponsive_backend()
+            expected = observed[-1] if observed else None
+            await self._restart_unresponsive_backend(expected)
             raise
 
     async def handle(self, raw: str) -> None:
