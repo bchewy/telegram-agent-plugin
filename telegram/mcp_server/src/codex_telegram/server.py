@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP
 
+from .health import install_tool_call_guard
 from .tools import account, cache, contacts, dialogs, extras, groups, media, messages
 
 mcp = FastMCP(
@@ -21,6 +22,7 @@ groups.register(mcp)
 contacts.register(mcp)
 extras.register(mcp)
 account.register(mcp)
+install_tool_call_guard(mcp)
 
 
 def run_server() -> None:

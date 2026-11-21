@@ -142,6 +142,75 @@ def register_proxy() -> Path:
     return path
 
 
+def _process_state(pid: int) -> str | None:
+    """proc(5) state character. ``Z`` means the process has already exited and
+    is waiting to be reaped; ``None`` means it is gone."""
+    fields = _read_stat_fields(pid)
+    if not fields:
+        return None
+    return fields[0]
+
+
+def _pid_is_live(pid: int) -> bool:
+    state = _process_state(pid)
+    return state is not None and state != "Z"
+
+
+def parent_gone(original_ppid: int) -> bool:
+    """True when the process that spawned us has exited.
+
+    A parent death reparents us to init (ppid 1) or a subreaper, which no
+    longer equals ``original_ppid``. A zombie parent counts as gone too: the
+    host has exited even if nobody has reaped it.
+
+    ppid 1 at the moment we first look means the host already exited while
+    this process was still importing — ``serve`` is not a daemon, so that is
+    an orphan too. Set ``CODEX_TELEGRAM_ALLOW_ORPHAN=1`` to keep a serve that
+    was started detached on purpose.
+    """
+    if os.getenv("CODEX_TELEGRAM_ALLOW_ORPHAN", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return False
+    current = os.getppid()
+    if current <= 1 or original_ppid <= 1:
+        return True
+    if current != original_ppid:
+        return True
+    return not _pid_is_live(original_ppid)
+
+
+def reap_orphaned_proxies(*, log=None) -> list[int]:
+    """SIGTERM registered proxies whose parent has gone away.
+
+    Proxies hold no Telegram client — the backend process does — so stopping
+    an orphan cannot open a second MTProto session. This catches serves left
+    behind by hosts that exited before this parent-watch existed. The calling
+    proxy and its ancestors are never targeted.
+    """
+    if not os.path.isdir("/proc"):
+        return []
+    protected = _self_and_ancestors()
+    killed: list[int] = []
+    for pid in registered_proxy_pids():
+        if pid in protected:
+            continue
+        parent = _parent_pid(pid)
+        if parent is not None and parent > 1 and _pid_is_live(parent):
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            continue
+        killed.append(pid)
+        if log is not None:
+            log(f"stopped orphaned serve pid={pid}")
+    return killed
+
+
 def registered_proxy_pids() -> set[int]:
     pids: set[int] = set()
     for entry in proxy_registry_dir().iterdir():

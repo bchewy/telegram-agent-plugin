@@ -41,7 +41,7 @@ def retry_env(monkeypatch):
 
 
 async def test_succeeds_on_later_attempt_after_connection_errors(upload_file, retry_env):
-    failures = [ConnectionResetError("peer reset"), BrokenPipeError("broken pipe")]
+    failures = [ConnectionResetError("peer reset")]
     attempts = []
 
     async def do_upload(client):
@@ -53,9 +53,9 @@ async def test_succeeds_on_later_attempt_after_connection_errors(upload_file, re
     result = await upload_with_retry(do_upload, file_path=upload_file, tool_name="send_video")
 
     assert result == "sent"
-    assert len(attempts) == 3
-    assert retry_env.discards == 2
-    assert retry_env.sleeps == [2.0, 5.0]
+    assert len(attempts) == 2
+    assert retry_env.discards == 1
+    assert retry_env.sleeps == [1.0]
 
 
 async def test_exhausted_retries_fail_fast_with_clear_error(upload_file, retry_env):
@@ -136,18 +136,42 @@ async def test_retries_use_a_fresh_client_after_discard(upload_file, retry_env):
 def test_upload_timeout_scales_with_file_size(tmp_path):
     small = tmp_path / "small.bin"
     small.write_bytes(b"x")
+    medium = tmp_path / "medium.bin"
+    medium.write_bytes(b"x" * (2 * 1024 * 1024))
     large = tmp_path / "large.bin"
     large.write_bytes(b"x" * (7 * 1024 * 1024))
 
     small_timeout = client_mod._upload_timeout_seconds(small)
+    medium_timeout = client_mod._upload_timeout_seconds(medium)
     large_timeout = client_mod._upload_timeout_seconds(large)
 
     assert small_timeout == pytest.approx(client_mod.UPLOAD_BASE_TIMEOUT_SECONDS, abs=1.0)
-    assert large_timeout > small_timeout
-    expected = client_mod.UPLOAD_BASE_TIMEOUT_SECONDS + (
+    assert medium_timeout > small_timeout
+    assert large_timeout == client_mod.UPLOAD_MAX_ATTEMPT_TIMEOUT_SECONDS
+    uncapped = client_mod.UPLOAD_BASE_TIMEOUT_SECONDS + (
         7 * 1024 * 1024 / client_mod.UPLOAD_MIN_BYTES_PER_SECOND
     )
-    assert large_timeout == pytest.approx(expected)
+    assert uncapped > client_mod.UPLOAD_MAX_ATTEMPT_TIMEOUT_SECONDS
+
+
+async def test_total_budget_returns_error_before_host_timeout(upload_file, retry_env, monkeypatch):
+    """A dead proxy must surface TelegramUploadError inside the host MCP wait."""
+    monkeypatch.setattr(client_mod, "UPLOAD_TOTAL_BUDGET_SECONDS", 0.05)
+    monkeypatch.setattr(client_mod, "_upload_timeout_seconds", lambda _path: 30.0)
+    monkeypatch.setattr(client_mod, "UPLOAD_ATTEMPTS", 5)
+    attempts = []
+
+    async def do_upload(client):
+        attempts.append(client)
+        # Hang like a reconnect-looping Telethon client. asyncio.sleep is
+        # stubbed by retry_env, so wait on a future the timeout can cancel.
+        await asyncio.Future()
+
+    with pytest.raises(TelegramUploadError) as excinfo:
+        await upload_with_retry(do_upload, file_path=upload_file, tool_name="send_video")
+
+    assert len(attempts) == 1  # budget exhausted after the first stall
+    assert isinstance(excinfo.value.__cause__, TimeoutError)
 
 
 class _FakeMCP:

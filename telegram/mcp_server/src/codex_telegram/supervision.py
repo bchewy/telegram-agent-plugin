@@ -1,0 +1,98 @@
+"""Stop a wedged backend without ever leaving two of them alive.
+
+The proxy uses this when the backend holds the unix socket but stops
+answering. The old process has to be dead — flock released, Telethon client
+gone with it — before the caller spawns a replacement. Signaling a pid whose
+command line is not this package's backend is refused.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import signal
+import time
+
+_BACKEND_ARGV_TAIL = (b"-m", b"codex_telegram", b"backend")
+
+
+def _read_lock_pid(lock_path: Path) -> int | None:
+    try:
+        return int(lock_path.read_text(encoding="ascii").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _proc_state(pid: int) -> str | None:
+    """proc(5) state character, or None if the process does not exist.
+
+    ``Z`` is a zombie: the kernel has already released its flocks and closed
+    its sockets, it just has not been reaped. Callers treat that as dead so a
+    new backend can take the lock without waiting on the parent.
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii", errors="replace")
+    except OSError:
+        return None
+    _pid, _comm, tail = stat.rpartition(")")
+    fields = tail.split()
+    if not fields:
+        return None
+    return fields[0]
+
+
+def pid_alive(pid: int) -> bool:
+    state = _proc_state(pid)
+    return state is not None and state != "Z"
+
+
+def is_backend_process(pid: int) -> bool:
+    """True only for ``python -m codex_telegram backend`` (or the console script)."""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return False
+    parts = [part for part in raw.split(b"\x00") if part]
+    if len(parts) >= 3 and tuple(parts[-3:]) == _BACKEND_ARGV_TAIL:
+        return True
+    return len(parts) >= 2 and parts[-1] == b"backend" and parts[-2].endswith(b"codex-telegram")
+
+
+def _wait_until_dead(pid: int, grace: float) -> bool:
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        if not pid_alive(pid):
+            return True
+        time.sleep(0.05)
+    return not pid_alive(pid)
+
+
+def terminate_locked_backend(lock_path: Path, *, grace: float = 8.0) -> bool:
+    """SIGTERM the backend holding ``lock_path``, SIGKILL if it survives.
+
+    Returns False when no backend was running. Raises if the pid in the lock
+    file is not our backend (we will not signal an unrelated process) or if
+    it is still alive after SIGKILL. Returns only once the old process can no
+    longer hold an MTProto session.
+    """
+    pid = _read_lock_pid(lock_path)
+    if pid is None or pid <= 0 or not pid_alive(pid):
+        return False
+    if not is_backend_process(pid):
+        raise RuntimeError(
+            f"refusing to signal pid {pid}: its command line is not a "
+            "codex_telegram backend"
+        )
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return False
+    if _wait_until_dead(pid, grace):
+        return True
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    if _wait_until_dead(pid, grace):
+        return True
+    raise RuntimeError(f"backend pid {pid} survived SIGKILL")

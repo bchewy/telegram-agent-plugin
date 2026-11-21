@@ -22,6 +22,10 @@
         "CODEX_TELEGRAM_BACKEND_START_TIMEOUT",
         "CODEX_TELEGRAM_PROXY_TIMEOUT",
         "CODEX_TELEGRAM_LEGACY_CLEANUP",
+        "CODEX_TELEGRAM_TOOL_TIMEOUT",
+        "CODEX_TELEGRAM_CONNECT_TIMEOUT",
+        "CODEX_TELEGRAM_HEALTH_INTERVAL",
+        "CODEX_TELEGRAM_HEALTH_PROBE_TIMEOUT",
         "TELEGRAM_MTPROXY_HOST",
         "TELEGRAM_MTPROXY_PORT",
         "TELEGRAM_MTPROXY_SECRET",
@@ -29,7 +33,7 @@
       ],
       "cwd": "./",
       "startup_timeout_sec": 20,
-      "tool_timeout_sec": 90
+      "tool_timeout_sec": 600
     }
   }
 }

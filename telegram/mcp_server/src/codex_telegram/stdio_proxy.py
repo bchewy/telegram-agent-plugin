@@ -25,8 +25,10 @@ import time
 
 import httpx
 
-from .legacy_serve import kill_legacy_serves, register_proxy
-from .runtime_paths import backend_log_path, backend_socket_path, config_dir
+from . import limits
+from .legacy_serve import kill_legacy_serves, parent_gone, reap_orphaned_proxies, register_proxy
+from .runtime_paths import backend_lock_path, backend_log_path, backend_socket_path, config_dir
+from .supervision import terminate_locked_backend
 
 SHARED_BACKEND_ENV_VARS = (
     "CODEX_TELEGRAM_SHARED_BACKEND",
@@ -43,6 +45,8 @@ DEFAULT_TOOL_TIMEOUT_SECONDS = 600.0
 CONNECT_TIMEOUT_SECONDS = 5.0
 PING_TIMEOUT_SECONDS = 2.0
 START_POLL_INTERVAL_SECONDS = 0.3
+# How often a serve checks that the MCP host which spawned it is still alive.
+PARENT_POLL_SECONDS = 0.5
 
 # Host part is ignored over a unix socket; it only has to be a valid URL.
 MCP_URL = "http://backend/mcp"
@@ -119,6 +123,14 @@ class Relay:
             transport=httpx.AsyncHTTPTransport(uds=str(self.sock_path)),
             timeout=httpx.Timeout(tool_timeout, connect=CONNECT_TIMEOUT_SECONDS),
         )
+        # The backend caps a tool call at TOOL_CALL_TIMEOUT_SECONDS and turns
+        # a wedge into an HTTP error. If that response never arrives, the
+        # backend process itself is frozen and has to be replaced. The bound
+        # stays under the host's tool_timeout_sec so the host sees this error
+        # instead of -32001.
+        self.response_deadline = (
+            limits.TOOL_CALL_TIMEOUT_SECONDS + limits.BACKEND_RESPONSE_GRACE_SECONDS
+        )
         self.out_lock = asyncio.Lock()
         self.start_lock = asyncio.Lock()
 
@@ -165,7 +177,7 @@ class Relay:
         FileNotFoundError,
     )
 
-    async def post(self, raw: str) -> httpx.Response:
+    async def _post_with_retry(self, raw: str) -> httpx.Response:
         for attempt in range(2):
             try:
                 return await self.client.post(MCP_URL, content=raw.encode("utf-8"), headers=HEADERS)
@@ -175,6 +187,34 @@ class Relay:
                 # Backend died mid-session (or never started): restart and retry.
                 await self.ensure_backend()
         raise AssertionError("unreachable")
+
+    async def _restart_unresponsive_backend(self) -> None:
+        """Kill the backend and start a new one, only after the old one is dead.
+
+        A timed-out call is not retried: the request may already have reached
+        Telegram (a send), and a second attempt would duplicate it. The next
+        call from the host lands on the fresh backend.
+        """
+        _err("backend did not answer within the deadline; restarting it")
+        try:
+            await asyncio.to_thread(terminate_locked_backend, backend_lock_path())
+        except Exception as exc:
+            _err(f"could not stop the wedged backend: {exc!r}")
+            return
+        try:
+            await self.ensure_backend()
+        except Exception as exc:
+            _err(f"backend did not come back after restart: {exc!r}")
+
+    async def post(self, raw: str) -> httpx.Response:
+        try:
+            return await asyncio.wait_for(
+                self._post_with_retry(raw),
+                timeout=self.response_deadline,
+            )
+        except (TimeoutError, httpx.TimeoutException):
+            await self._restart_unresponsive_backend()
+            raise
 
     async def handle(self, raw: str) -> None:
         try:
@@ -215,36 +255,97 @@ class Relay:
                 )
 
 
+async def _watch_parent(parent: int, stop: asyncio.Event) -> None:
+    while not stop.is_set():
+        if parent_gone(parent):
+            _err("parent process is gone; exiting")
+            stop.set()
+            return
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=PARENT_POLL_SECONDS)
+            return
+        except TimeoutError:
+            continue
+
+
+async def _cancel_tasks(tasks: set[asyncio.Task]) -> None:
+    for task in tasks:
+        task.cancel()
+    if not tasks:
+        return
+    _done, pending = await asyncio.wait(tasks, timeout=2)
+    if pending:
+        # A request stuck in a hung socket must not keep an orphan serve alive.
+        os._exit(0)
+
+
 async def _run_relay() -> None:
     relay = Relay()
     loop = asyncio.get_running_loop()
     lines: asyncio.Queue = asyncio.Queue()
+    stop = asyncio.Event()
+    parent = os.getppid()
 
     def reader() -> None:
-        for line in sys.stdin.buffer:
-            loop.call_soon_threadsafe(lines.put_nowait, line.decode("utf-8", "replace"))
-        loop.call_soon_threadsafe(lines.put_nowait, None)
+        try:
+            for line in sys.stdin.buffer:
+                loop.call_soon_threadsafe(lines.put_nowait, line.decode("utf-8", "replace"))
+        except Exception:
+            pass
+        try:
+            # stdin hit EOF (the host closed its end) or the pipe broke.
+            loop.call_soon_threadsafe(stop.set)
+        except RuntimeError:
+            pass
 
     threading.Thread(target=reader, daemon=True).start()
-    try:
-        await relay.ensure_backend()
-    except Exception as exc:
-        # Not fatal: per-request retries may still bring the backend up, and
-        # request-level failures surface as JSON-RPC errors.
-        _err(str(exc))
+    watcher = asyncio.create_task(_watch_parent(parent, stop))
     tasks: set[asyncio.Task] = set()
-    while True:
-        line = await lines.get()
-        if line is None:
-            break
-        line = line.strip()
-        if not line:
-            continue
-        task = asyncio.create_task(relay.handle(line))
-        tasks.add(task)
-        task.add_done_callback(tasks.discard)
-    if tasks:
-        await asyncio.wait(tasks, timeout=5)
+    try:
+        ensure = asyncio.create_task(relay.ensure_backend())
+        stopper = asyncio.create_task(stop.wait())
+        await asyncio.wait({ensure, stopper}, return_when=asyncio.FIRST_COMPLETED)
+        if stop.is_set():
+            ensure.cancel()
+            try:
+                await ensure
+            except (asyncio.CancelledError, Exception):
+                pass
+            return
+        stopper.cancel()
+        try:
+            await ensure
+        except Exception as exc:
+            # Not fatal: per-request retries may still bring the backend up,
+            # and request-level failures surface as JSON-RPC errors.
+            _err(str(exc))
+
+        while not stop.is_set():
+            incoming = asyncio.create_task(lines.get())
+            stopper = asyncio.create_task(stop.wait())
+            done, _pending = await asyncio.wait(
+                {incoming, stopper}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if incoming not in done:
+                incoming.cancel()
+                break
+            stopper.cancel()
+            line = incoming.result()
+            if not isinstance(line, str):
+                continue
+            line = line.strip()
+            if not line:
+                continue
+            task = asyncio.create_task(relay.handle(line))
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+    finally:
+        watcher.cancel()
+        try:
+            await watcher
+        except asyncio.CancelledError:
+            pass
+        await _cancel_tasks(tasks)
 
 
 def run_proxy() -> None:
@@ -257,4 +358,8 @@ def run_proxy() -> None:
         killed = kill_legacy_serves(log=_err)
         if killed:
             _err(f"removed {len(killed)} legacy serve process(es)")
+        # Orphans hold no MTProto client; reaping them cannot double a session.
+        reaped = reap_orphaned_proxies(log=_err)
+        if reaped:
+            _err(f"removed {len(reaped)} orphaned serve process(es)")
     asyncio.run(_run_relay())
