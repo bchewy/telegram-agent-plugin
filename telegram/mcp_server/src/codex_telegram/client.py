@@ -170,17 +170,36 @@ async def upload_with_retry(
         if remaining <= 0:
             break
         if client is None:
-            client = await get_client()
+            # Reconnect spends the same budget as the transfer. Measuring
+            # the allowance before get_client() let a slow connect plus a
+            # full-length retry run well past UPLOAD_TOTAL_BUDGET_SECONDS.
+            try:
+                client = await asyncio.wait_for(get_client(), timeout=remaining)
+            except (asyncio.TimeoutError, TimeoutError) as exc:
+                last_error = exc
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                last_error = TimeoutError("upload budget exhausted during reconnect")
+                break
+        # Keep the disconnect bound in reserve once the budget is large
+        # enough to matter, so teardown still fits inside it. A budget
+        # smaller than that bound (tests) is spent on the transfer itself.
+        reserve = DISCONNECT_TIMEOUT_SECONDS if remaining > DISCONNECT_TIMEOUT_SECONDS else 0.0
+        transfer = min(per_attempt, remaining - reserve)
+        if transfer <= 0:
+            last_error = TimeoutError("upload budget exhausted")
+            break
         attempts_used = attempt
         try:
-            return await asyncio.wait_for(
-                do_upload(client),
-                timeout=min(per_attempt, remaining),
-            )
+            return await asyncio.wait_for(do_upload(client), timeout=transfer)
         except (ConnectionError, TimeoutError) as exc:
             last_error = exc
+            failed = client
             client = None
-            await _discard_client()
+            # Holds the client lock until disconnect finishes, so a concurrent
+            # get_client cannot dial a second session on the same auth key.
+            await _discard_client(failed)
             if attempt < UPLOAD_ATTEMPTS:
                 backoff = UPLOAD_RETRY_BACKOFF_SECONDS[
                     min(attempt - 1, len(UPLOAD_RETRY_BACKOFF_SECONDS) - 1)
@@ -189,7 +208,8 @@ async def upload_with_retry(
                 if time.monotonic() + backoff >= deadline:
                     break
                 await asyncio.sleep(backoff)
-    assert last_error is not None
+    if last_error is None:
+        last_error = TimeoutError("upload budget exhausted")
     raise TelegramUploadError(
         tool_name=tool_name,
         file_path=file_path,
@@ -309,15 +329,50 @@ async def _shutdown_client(client: TelegramClient, *, context: str) -> None:
         logger.debug("disconnect raised during %s", context, exc_info=True)
 
 
-async def _discard_client() -> None:
+async def _await_shutdown(client: TelegramClient, *, context: str) -> None:
+    """Disconnect ``client`` even when this task is already being cancelled.
+
+    The next ``await`` in a cancelled task raises ``CancelledError`` immediately,
+    which would skip teardown and return with the sender still connected. Drain
+    the cancellation, close the sender, then restore it so the caller still
+    unwinds.
+    """
+    task = asyncio.current_task()
+    pending = task.cancelling() if task is not None else 0
+    for _ in range(pending):
+        if task is not None:
+            task.uncancel()
+    try:
+        await _shutdown_client(client, context=context)
+    finally:
+        if pending and task is not None:
+            task.cancel()
+
+
+async def _discard_locked(expected: TelegramClient | None = None) -> None:
+    """Disconnect the shared client. Caller holds ``_client_lock``.
+
+    The lock is held across the disconnect on purpose: ``get_client`` takes
+    the same lock before ``connect()``, so a replacement cannot start while
+    this sender is still up. ``expected`` lets a stale caller (an upload that
+    failed, a verify that lost the race) no-op once a newer client is installed.
+    """
     global _client, _last_client_verify_monotonic
 
     client = _client
+    if client is None:
+        return
+    if expected is not None and client is not expected:
+        return
     # Stop handing the doomed client out before awaiting anything.
     _client = None
     _last_client_verify_monotonic = 0.0
-    if client is not None:
-        await _shutdown_client(client, context="discard")
+    await _shutdown_client(client, context="discard")
+
+
+async def _discard_client(expected: TelegramClient | None = None) -> None:
+    async with _client_lock:
+        await _discard_locked(expected)
 
 
 async def force_reset_client(*, reason: str) -> bool:
@@ -365,7 +420,7 @@ async def force_reset_client(*, reason: str) -> bool:
         )
         raise ConnectionError("Telegram client lock is stuck; the backend is restarting.")
     try:
-        await _discard_client()
+        await _discard_locked()
     finally:
         _client_lock.release()
     return True
@@ -377,7 +432,7 @@ def current_client() -> TelegramClient | None:
     return _client
 
 
-async def _verify_client_connection(client: TelegramClient) -> None:
+async def _verify_client_connection(client: TelegramClient, *, holding_lock: bool = False) -> None:
     global _last_client_verify_monotonic
 
     if not client.is_connected():
@@ -393,7 +448,10 @@ async def _verify_client_connection(client: TelegramClient) -> None:
             timeout=CONNECTION_VERIFY_TIMEOUT_SECONDS,
         )
     except Exception as exc:
-        await _discard_client()
+        if holding_lock:
+            await _discard_locked(client)
+        else:
+            await _discard_client(client)
         raise ConnectionError("Telegram connection is stale.") from exc
 
     _last_client_verify_monotonic = now
@@ -413,7 +471,7 @@ async def get_client() -> TelegramClient:
     client = _client
     if client:
         try:
-            await _verify_client_connection(client)
+            await _verify_client_connection(client, holding_lock=False)
             return client
         except ConnectionError:
             pass
@@ -422,7 +480,7 @@ async def get_client() -> TelegramClient:
         client = _client
         if client:
             try:
-                await _verify_client_connection(client)
+                await _verify_client_connection(client, holding_lock=True)
                 return client
             except ConnectionError:
                 pass
@@ -440,15 +498,25 @@ async def get_client() -> TelegramClient:
         except (asyncio.TimeoutError, TimeoutError) as exc:
             # The cancelled connect may have left a half-started sender.
             # Prove it is dead before anyone is allowed to build another.
-            await _shutdown_client(client, context="connect timeout")
+            await _await_shutdown(client, context="connect timeout")
             raise ConnectionError(
                 f"Telegram connect timed out after {CONNECT_TIMEOUT_SECONDS:.0f}s "
                 "(proxy unreachable or not delivering replies). The connection "
                 "was torn down; retry shortly."
             ) from exc
+        except asyncio.CancelledError:
+            # The tool deadline (or the host dropping the request) can cancel
+            # get_client while Telethon is already past TCP connect, waiting
+            # on the startup RPC. CancelledError is a BaseException, so the
+            # Exception handler below does not run. The client is not in
+            # `_client` yet; leaving it connected lets the next call dial a
+            # second session on the same auth key.
+            if _client is not client:
+                await _await_shutdown(client, context="connect cancelled")
+            raise
         except Exception:
             if _client is not client:
-                await _shutdown_client(client, context="connect failed")
+                await _await_shutdown(client, context="connect failed")
             raise
 
         _client = client

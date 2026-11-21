@@ -323,6 +323,146 @@ async def test_wedged_tool_call_errors_inside_the_timeout_and_resets(monkeypatch
     assert INFLIGHT.oldest_age() is None
 
 
+async def test_cancelled_rpc_becomes_a_tool_error_and_a_real_cancel_does_not(monkeypatch):
+    """Telethon disconnect() cancels the pending RPC future.
+
+    That CancelledError is a BaseException, so FastMCP will not turn it into
+    a tool result. The guard has to. Cancelling the tool task itself — the
+    host dropped the HTTP request — must still propagate.
+    """
+    _arm(monkeypatch)
+
+    class _RPC:
+        def __init__(self):
+            self.fut: asyncio.Future | None = None
+
+        async def call_tool(self, name, arguments, *args, **kwargs):
+            self.fut = asyncio.get_running_loop().create_future()
+            await self.fut
+
+    rpc = _RPC()
+
+    class _MCP:
+        _tool_manager = rpc
+
+    mcp = _MCP()
+    install_tool_call_guard(mcp)
+
+    stalled = asyncio.create_task(mcp._tool_manager.call_tool("get_me", {}))
+    for _ in range(50):
+        if rpc.fut is not None:
+            break
+        await asyncio.sleep(0.01)
+    assert rpc.fut is not None
+    rpc.fut.cancel()
+    with pytest.raises(ConnectionError, match="connection was reset"):
+        await stalled
+
+    stalled = asyncio.create_task(mcp._tool_manager.call_tool("get_me", {}))
+    for _ in range(50):
+        if rpc.fut is not None and not rpc.fut.done():
+            break
+        await asyncio.sleep(0.01)
+    stalled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stalled
+
+
+async def test_watchdog_survives_a_probe_cancelled_by_disconnect(monkeypatch):
+    _arm(monkeypatch)
+    monkeypatch.setattr(limits, "HEALTH_PROBE_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(limits, "HEALTH_PROBE_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(limits, "PROBE_FAILURES_BEFORE_RESET", 2)
+
+    class _CancelledProbe(_Client):
+        async def __call__(self, request):
+            raise asyncio.CancelledError()
+
+    client = _CancelledProbe()
+    client.connected = True
+    client_mod._client = client
+    stop = asyncio.Event()
+    task = asyncio.create_task(watchdog_loop(stop))
+    for _ in range(50):
+        if client.disconnects:
+            break
+        await asyncio.sleep(0.02)
+    stop.set()
+    await task
+    assert client.disconnects == 1
+    assert client_mod.current_client() is None
+    assert task.cancelled() is False
+
+
+async def test_cancelled_connect_tears_the_sender_down_before_the_lock_drops(monkeypatch):
+    _arm(monkeypatch, connect_timeout=5.0)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    built = []
+
+    class _Slow(_Client):
+        async def connect(self) -> None:
+            started.set()
+            await release.wait()
+            await super().connect()
+
+    def build(*_args):
+        client = _Slow()
+        built.append(client)
+        return client
+
+    monkeypatch.setattr(client_mod, "_build_client", build)
+    monkeypatch.setattr(client_mod, "load_session", _session)
+
+    connecting = asyncio.create_task(client_mod.get_client())
+    await asyncio.wait_for(started.wait(), timeout=1)
+    connecting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await connecting
+
+    assert len(built) == 1
+    assert built[0].disconnects == 1
+    assert client_mod._client is None
+    assert client_mod._client_unrecoverable is False
+
+    release.set()
+    second = await client_mod.get_client()
+    assert second.connected
+    assert second is not built[0]
+    assert sum(client.connected for client in built) == 1
+
+
+async def test_discard_blocks_a_new_connect_until_the_old_sender_is_down(monkeypatch):
+    _arm(monkeypatch)
+    old = _Client()
+    old.connected = True
+    gate = asyncio.Event()
+
+    async def slow_disconnect():
+        await gate.wait()
+        old.disconnects += 1
+        old.connected = False
+
+    old.disconnect = slow_disconnect  # type: ignore[method-assign]
+    client_mod._client = old
+    monkeypatch.setattr(client_mod, "_build_client", lambda *_a: _Client())
+    monkeypatch.setattr(client_mod, "load_session", _session)
+
+    discarding = asyncio.create_task(client_mod._discard_client(old))
+    await asyncio.sleep(0.05)
+    connecting = asyncio.create_task(client_mod.get_client())
+    await asyncio.sleep(0.05)
+    assert not connecting.done()
+    assert not old.disconnects
+    gate.set()
+    await discarding
+    fresh = await connecting
+    assert old.disconnects == 1
+    assert not old.connected
+    assert fresh.connected
+    assert fresh is not old
+
+
 async def test_watchdog_resets_a_client_whose_rpcs_never_return(monkeypatch):
     _arm(monkeypatch)
     monkeypatch.setattr(limits, "HEALTH_PROBE_INTERVAL_SECONDS", 0.05)
@@ -399,21 +539,39 @@ def test_repeated_resets_escalate_instead_of_looping(monkeypatch):
     assert "did not stick" in reasons[-1]
 
 
-def test_reap_kills_only_orphaned_proxies(monkeypatch):
+def test_reap_kills_only_orphaned_proxies(monkeypatch, tmp_path):
     killed = []
-    monkeypatch.setattr(legacy_serve, "registered_proxy_pids", lambda: {10, 20, os.getpid()})
+    dropped = []
+    monkeypatch.setenv("CODEX_TELEGRAM_CONFIG_DIR", str(tmp_path))
+    # 10: orphaned serve. 20: serve whose parent is alive. 77: pid reused by
+    # something that is not a serve and has been reparented to init.
+    monkeypatch.setattr(legacy_serve, "registered_proxy_pids", lambda: {10, 20, 77, os.getpid()})
     monkeypatch.setattr(legacy_serve, "_self_and_ancestors", lambda: {os.getpid()})
     monkeypatch.setattr(
         legacy_serve,
         "_parent_pid",
-        lambda pid: {10: 1, 20: 50, os.getpid(): 49}[pid],
+        lambda pid: {10: 1, 20: 50, 77: 1, os.getpid(): 49}[pid],
     )
     monkeypatch.setattr(legacy_serve, "_pid_is_live", lambda pid: pid == 50)
+
+    def cmdline(pid):
+        if pid in (10, 20):
+            return ["python", "-m", "codex_telegram", "serve"]
+        return ["python", "/usr/bin/unrelated-daemon"]
+
+    monkeypatch.setattr(legacy_serve, "_read_cmdline", cmdline)
     monkeypatch.setattr(legacy_serve.os, "kill", lambda pid, _sig: killed.append(pid))
+    monkeypatch.setattr(
+        legacy_serve.Path,
+        "unlink",
+        lambda self, missing_ok=False: dropped.append(self.name),
+    )
 
     assert legacy_serve.reap_orphaned_proxies() == [10]
     assert 20 not in killed
+    assert 77 not in killed
     assert os.getpid() not in killed
+    assert "77" in dropped
 
 
 def test_parent_gone_tracks_reparent_and_zombies(monkeypatch):
@@ -432,6 +590,12 @@ def test_parent_gone_tracks_reparent_and_zombies(monkeypatch):
     monkeypatch.setattr(legacy_serve, "_pid_is_live", lambda _pid: False)
     assert legacy_serve.parent_gone(50) is True
     monkeypatch.setattr(legacy_serve, "_pid_is_live", lambda _pid: True)
+    assert legacy_serve.parent_gone(50) is False
+
+    # No procfs (macOS). A live parent whose pid still matches must not look
+    # dead just because /proc/<pid>/stat cannot be read.
+    monkeypatch.setattr(legacy_serve.os.path, "isdir", lambda _path: False)
+    monkeypatch.setattr(legacy_serve, "_pid_is_live", lambda _pid: False)
     assert legacy_serve.parent_gone(50) is False
 
 
@@ -513,3 +677,53 @@ async def test_restart_spawns_only_after_the_old_backend_is_stopped(tmp_path, mo
     monkeypatch.setattr(Relay, "ensure_backend", ensure)
     await relay._restart_unresponsive_backend()
     assert order == ["kill"]
+
+
+@pytest.mark.parametrize(
+    "exc_type",
+    [httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError],
+)
+async def test_proxy_does_not_replay_a_request_the_backend_may_have_accepted(
+    tmp_path, monkeypatch, exc_type
+):
+    monkeypatch.setenv("CODEX_TELEGRAM_CONFIG_DIR", str(tmp_path))
+    relay = Relay()
+    calls = []
+
+    async def post(_url, content, headers):
+        calls.append("post")
+        raise exc_type("backend closed the socket")
+
+    relay.client.post = post
+
+    async def ensure(self):
+        calls.append("ensure")
+
+    monkeypatch.setattr(Relay, "ensure_backend", ensure)
+    with pytest.raises(exc_type):
+        await relay.post("{}")
+    assert calls == ["post"]
+
+
+async def test_proxy_retries_a_connect_failure_that_never_reached_the_backend(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("CODEX_TELEGRAM_CONFIG_DIR", str(tmp_path))
+    relay = Relay()
+    calls = []
+
+    async def post(_url, content, headers):
+        calls.append("post")
+        if calls.count("post") == 1:
+            raise httpx.ConnectError("socket not listening")
+        return httpx.Response(202)
+
+    relay.client.post = post
+
+    async def ensure(self):
+        calls.append("ensure")
+
+    monkeypatch.setattr(Relay, "ensure_backend", ensure)
+    response = await relay.post("{}")
+    assert response.status_code == 202
+    assert calls == ["post", "ensure", "post"]

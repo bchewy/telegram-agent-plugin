@@ -314,7 +314,12 @@ def test_backend_restart_after_kill(shared_env):
         # it), so check the live-backend scan rather than /proc existence.
         _wait_for(lambda: old_pid not in _backend_pids(config_dir), message="backend death")
 
-        reply = proxy.rpc(2, "tools/list")
+        # The request that hit the dead socket is not replayed. A dropped
+        # response is ambiguous (the backend may already have sent a Telegram
+        # message), so the proxy returns the error and lets the next call
+        # start the replacement.
+        interrupted = proxy.rpc(2, "tools/list")
+        reply = interrupted if "error" not in interrupted else proxy.rpc(3, "tools/list")
         assert "error" not in reply, reply
         assert any(t["name"] == "get_me" for t in reply["result"]["tools"])
 

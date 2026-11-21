@@ -28,7 +28,7 @@ def retry_env(monkeypatch):
         state.fresh_clients.append(fresh)
         return fresh
 
-    async def fake_discard_client():
+    async def fake_discard_client(expected=None):
         state.discards += 1
 
     async def fake_sleep(seconds):
@@ -171,6 +171,35 @@ async def test_total_budget_returns_error_before_host_timeout(upload_file, retry
         await upload_with_retry(do_upload, file_path=upload_file, tool_name="send_video")
 
     assert len(attempts) == 1  # budget exhausted after the first stall
+    assert isinstance(excinfo.value.__cause__, TimeoutError)
+
+
+async def test_reconnect_time_counts_against_the_upload_budget(upload_file, monkeypatch):
+    """The allowance is what is left after get_client returns, not before it."""
+    monkeypatch.setattr(client_mod, "UPLOAD_TOTAL_BUDGET_SECONDS", 1.0)
+    monkeypatch.setattr(client_mod, "UPLOAD_ATTEMPTS", 2)
+    monkeypatch.setattr(client_mod, "_upload_timeout_seconds", lambda _path: 10.0)
+
+    async def slow_get_client():
+        await asyncio.sleep(0.8)
+        return SimpleNamespace(name="fresh")
+
+    async def discard(expected=None):
+        return None
+
+    monkeypatch.setattr(client_mod, "get_client", slow_get_client)
+    monkeypatch.setattr(client_mod, "_discard_client", discard)
+
+    async def do_upload(_client):
+        await asyncio.Future()
+
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(TelegramUploadError) as excinfo:
+        await upload_with_retry(do_upload, file_path=upload_file, tool_name="send_video")
+    elapsed = asyncio.get_running_loop().time() - started
+    # 0.8s reconnect plus the leftover slice of the 1s budget. Charging the
+    # full pre-reconnect remainder on top would land near 1.8s.
+    assert elapsed < 1.4
     assert isinstance(excinfo.value.__cause__, TimeoutError)
 
 

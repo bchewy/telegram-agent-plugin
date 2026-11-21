@@ -187,6 +187,18 @@ def install_tool_call_guard(mcp) -> None:
                 "connection stopped delivering replies. The connection was "
                 "reset; retry."
             ) from exc
+        except asyncio.CancelledError:
+            # Telethon's disconnect() cancels pending RPC futures. That
+            # CancelledError is not an Exception, so FastMCP would not turn it
+            # into a tool result and the proxy would wait out its deadline,
+            # then kill the backend we just recovered. A cancellation of this
+            # task itself (the host dropped the HTTP request) still propagates.
+            if _task_is_cancelling():
+                raise
+            raise ConnectionError(
+                f"{name} was cancelled because the Telegram connection was "
+                "reset. Retry."
+            )
         finally:
             INFLIGHT.end(token)
 
@@ -226,6 +238,17 @@ async def probe_client(client) -> None:
     await client(functions.help.GetNearestDcRequest())
 
 
+def _task_is_cancelling() -> bool:
+    """True when this task was cancelled, not an inner future it awaits.
+
+    ``Future.cancel()`` (what Telethon does to a pending RPC on disconnect)
+    raises ``CancelledError`` at the ``await`` without marking the task
+    cancelling. ``Task.cancel()`` does both.
+    """
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
+
+
 def _looks_connected(client) -> bool:
     is_connected = getattr(client, "is_connected", None)
     if not callable(is_connected):
@@ -263,15 +286,28 @@ async def watchdog_loop(stop: asyncio.Event) -> None:
         if client is None or not _looks_connected(client):
             failures = 0
             continue
+        probe_error: BaseException | None = None
         try:
             await asyncio.wait_for(probe_client(client), limits.HEALTH_PROBE_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            # A storm reset disconnects the sender and cancels this probe's
+            # RPC. That must not kill the watchdog. A cancellation of the
+            # watchdog task itself still ends the loop.
+            if _task_is_cancelling():
+                raise
+            probe_error = ConnectionError("health probe cancelled by sender teardown")
         except Exception as exc:
+            probe_error = exc
+        if probe_error is not None:
             failures += 1
-            _note(f"health probe failed ({failures}/{limits.PROBE_FAILURES_BEFORE_RESET}): {exc!r}")
+            _note(
+                f"health probe failed ({failures}/{limits.PROBE_FAILURES_BEFORE_RESET}): "
+                f"{probe_error!r}"
+            )
             if failures >= limits.PROBE_FAILURES_BEFORE_RESET:
                 failures = 0
                 try:
-                    await force_reset_client(reason=f"health probe failed: {exc!r}")
+                    await force_reset_client(reason=f"health probe failed: {probe_error!r}")
                 except Exception as reset_exc:
                     _note(f"health reset failed: {reset_exc!r}")
                     return

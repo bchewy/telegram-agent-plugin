@@ -166,14 +166,15 @@ class Relay:
                 f"check {backend_log_path()}"
             )
 
-    # Transport failures that mean the backend is gone (dead socket, stale
-    # pooled connection to a killed process). Deliberately excludes timeouts:
-    # retrying a slow tool call could execute it twice.
+    # Failures that mean the request never reached the backend, so replaying
+    # it cannot double a Telegram send. A dropped response (ReadError,
+    # RemoteProtocolError) or a write that may have been accepted is not in
+    # this list: the tool may already have sent a message, and the recovery
+    # path that os._exit's the backend closes the socket after that send.
+    # Timeouts are excluded for the same reason; post() restarts the backend
+    # and returns the error to the host instead of retrying.
     _RETRYABLE_ERRORS = (
         httpx.ConnectError,
-        httpx.ReadError,
-        httpx.WriteError,
-        httpx.RemoteProtocolError,
         FileNotFoundError,
     )
 

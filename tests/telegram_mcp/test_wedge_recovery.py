@@ -109,7 +109,10 @@ SITECUSTOMIZE = textwrap.dedent(
         async def _maybe_wedge(self):
             if _mode() == "hang":
                 await self._released.wait()
-                raise ConnectionError("wedged sender dropped")
+                # Telethon's disconnect() cancels the pending RPC future,
+                # which raises CancelledError in the caller. ConnectionError
+                # would hide a guard that lets that cancellation escape.
+                raise asyncio.CancelledError()
 
         async def __call__(self, request):
             await self._maybe_wedge()

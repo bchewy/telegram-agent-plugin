@@ -180,6 +180,11 @@ def parent_gone(original_ppid: int) -> bool:
         return True
     if current != original_ppid:
         return True
+    if not os.path.isdir("/proc"):
+        # macOS and anything else without procfs. A missing /proc record is
+        # not a dead parent; the ppid comparison above is the check we have.
+        # stdin EOF still ends a serve whose host closed the pipe.
+        return False
     return not _pid_is_live(original_ppid)
 
 
@@ -200,6 +205,13 @@ def reap_orphaned_proxies(*, log=None) -> list[int]:
             continue
         parent = _parent_pid(pid)
         if parent is not None and parent > 1 and _pid_is_live(parent):
+            continue
+        # The registry is a pid written at startup and removed via atexit.
+        # A hard kill skips atexit, and Linux will reuse that pid. Signaling
+        # on the number alone can SIGTERM whatever now owns it. Require the
+        # live command line to still be a serve; drop the entry otherwise.
+        if not is_direct_serve_cmdline(_read_cmdline(pid)):
+            (proxy_registry_dir() / str(pid)).unlink(missing_ok=True)
             continue
         try:
             os.kill(pid, signal.SIGTERM)
