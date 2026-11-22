@@ -232,7 +232,7 @@ def test_second_backend_process_exits(shared_env):
         assert second.returncode == 0
         assert b"another backend already holds" in stderr
         assert first.poll() is None, "first backend must keep running"
-        assert int(_lock_path(config_dir).read_text().strip()) == first.pid
+        assert int(_lock_path(config_dir).read_text().split()[0]) == first.pid
     finally:
         first.terminate()
         first.wait(timeout=15)
@@ -261,7 +261,7 @@ def test_proxy_autostarts_backend(shared_env):
         assert result["result"]["serverInfo"]["name"] == "telegram"
         pids = _backend_pids(config_dir)
         assert len(pids) == 1
-        assert int(_lock_path(config_dir).read_text().strip()) == pids[0]
+        assert int(_lock_path(config_dir).read_text().split()[0]) == pids[0]
     finally:
         proxy.close()
 
@@ -292,7 +292,7 @@ def test_two_concurrent_proxies_share_one_backend(shared_env):
             message="flock loser to exit, leaving one backend",
         )
         (backend_pid,) = _backend_pids(config_dir)
-        assert int(_lock_path(config_dir).read_text().strip()) == backend_pid
+        assert int(_lock_path(config_dir).read_text().split()[0]) == backend_pid
         markers = list(marker_dir.iterdir())
         assert len(markers) == 1, (
             f"expected exactly one Telegram client across both proxies, got {markers}"
@@ -314,12 +314,17 @@ def test_backend_restart_after_kill(shared_env):
         # it), so check the live-backend scan rather than /proc existence.
         _wait_for(lambda: old_pid not in _backend_pids(config_dir), message="backend death")
 
-        reply = proxy.rpc(2, "tools/list")
+        # The request that hit the dead socket is not replayed. A dropped
+        # response is ambiguous (the backend may already have sent a Telegram
+        # message), so the proxy returns the error and lets the next call
+        # start the replacement.
+        interrupted = proxy.rpc(2, "tools/list")
+        reply = interrupted if "error" not in interrupted else proxy.rpc(3, "tools/list")
         assert "error" not in reply, reply
         assert any(t["name"] == "get_me" for t in reply["result"]["tools"])
 
         (new_pid,) = _backend_pids(config_dir)
         assert new_pid != old_pid
-        assert int(_lock_path(config_dir).read_text().strip()) == new_pid
+        assert int(_lock_path(config_dir).read_text().split()[0]) == new_pid
     finally:
         proxy.close()

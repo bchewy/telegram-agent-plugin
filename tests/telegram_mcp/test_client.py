@@ -252,7 +252,7 @@ def test_get_client_fast_path_survives_concurrent_discard(monkeypatch):
     fake = _FakeTelegramClient(connected=True)
     monkeypatch.setattr(client, "_client", fake)
 
-    async def discarding_verify(_client):
+    async def discarding_verify(_client, holding_lock=False):
         client._client = None  # simulate a concurrent _discard_client()
 
     monkeypatch.setattr(client, "_verify_client_connection", discarding_verify)
