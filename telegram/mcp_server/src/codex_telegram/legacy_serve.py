@@ -269,10 +269,11 @@ def _process_allows_orphan(pid: int) -> bool:
 def _registered_start_token(pid: int) -> str | None:
     """Start token recorded at registration. None for a pid-only entry."""
     try:
-        parts = (proxy_registry_dir() / str(pid)).read_text(encoding="ascii").split()
+        text = (proxy_registry_dir() / str(pid)).read_text(encoding="ascii").strip()
     except OSError:
         return None
-    return parts[1] if len(parts) > 1 else None
+    _pid, _sep, token = text.partition(" ")
+    return token.strip() or None
 
 
 def registered_proxy_pids() -> set[int]:

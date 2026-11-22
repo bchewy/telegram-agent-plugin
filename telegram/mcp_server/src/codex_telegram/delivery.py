@@ -26,6 +26,10 @@ MUTATING_TOOLS = frozenset(
         "send_poll",
         "set_profile_photo",
         "delete_contact",
+        "add_contact",
+        "block_user",
+        "unblock_user",
+        "mark_as_read",
         "delete_chat",
     }
 )
@@ -37,7 +41,6 @@ def is_mutating_tool(name: str | None) -> bool:
 
 def delivery_unknown_message(name: str) -> str:
     return (
-        f"{name}: delivery unknown. The request reached Telegram and the "
-        "outcome was not observed, so it was not retried. It may already "
-        "have been delivered."
+        f"{name}: delivery unknown. The request may have reached Telegram "
+        "and the outcome was not observed, so it was not retried."
     )

@@ -767,10 +767,104 @@ def test_terminate_does_not_kill_a_replacement_backend(monkeypatch, tmp_path):
     assert signals == []
 
 
+def test_identity_without_proc_uses_ps(monkeypatch):
+    monkeypatch.setattr(supervision.os.path, "isdir", lambda _path: False)
+
+    def ps_field(_pid, column):
+        if column == "command":
+            return "python -m codex_telegram backend"
+        if column == "lstart":
+            return "Sun Nov 22 12:00:00 2026"
+        return None
+
+    monkeypatch.setattr(supervision, "_ps_field", ps_field)
+    monkeypatch.setattr(supervision, "_posix_pid_exists", lambda _pid: True)
+    assert supervision.pid_alive(9) is True
+    assert supervision.is_backend_process(9) is True
+    assert supervision.process_start_token(9) == "Sun Nov 22 12:00:00 2026"
+    monkeypatch.setattr(supervision, "_posix_pid_exists", lambda _pid: False)
+    assert supervision.pid_alive(9) is False
+
+
 def test_is_backend_process_matches_the_module_invocation_only():
     assert supervision._BACKEND_ARGV_TAIL == (b"-m", b"codex_telegram", b"backend")
     # The pytest process is not a backend, whatever its command line contains.
     assert supervision.is_backend_process(os.getpid()) is False
+
+
+async def test_restart_does_not_signal_when_the_request_saw_no_pid(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_TELEGRAM_CONFIG_DIR", str(tmp_path))
+    relay = Relay()
+    signaled = []
+    monkeypatch.setattr(
+        "codex_telegram.stdio_proxy.terminate_locked_backend",
+        lambda *_args, **_kwargs: signaled.append(1),
+    )
+
+    async def ensure(self):
+        signaled.append("ensure")
+
+    monkeypatch.setattr(Relay, "ensure_backend", ensure)
+    await relay._restart_unresponsive_backend(None)
+    assert signaled == ["ensure"]
+
+
+async def test_cancel_during_discard_waits_for_disconnect_before_dropping_the_lock(monkeypatch):
+    _arm(monkeypatch)
+    client = _Client()
+    client.connected = True
+    client_mod._client = client
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def disconnect():
+        started.set()
+        await release.wait()
+        client.disconnects += 1
+        client.connected = False
+
+    client.disconnect = disconnect
+    task = asyncio.create_task(client_mod._discard_client(client))
+    await started.wait()
+    task.cancel()
+    assert client_mod._client_lock.locked()
+    assert client.disconnects == 0
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert client.disconnects == 1
+    assert not client_mod._client_lock.locked()
+
+
+async def test_a_cancelled_reset_does_not_debounce_the_live_client(monkeypatch):
+    _arm(monkeypatch, debounce=30.0)
+    client = _Client()
+    client.connected = True
+    client_mod._client = client
+    release = asyncio.Event()
+
+    async def hold():
+        await client_mod._client_lock.acquire()
+        try:
+            await release.wait()
+        finally:
+            client_mod._client_lock.release()
+
+    holder = asyncio.create_task(hold())
+    for _ in range(50):
+        if client_mod._client_lock.locked():
+            break
+        await asyncio.sleep(0.01)
+    resetting = asyncio.create_task(client_mod.force_reset_client(reason="storm"))
+    await asyncio.sleep(0.05)
+    resetting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await resetting
+    release.set()
+    await holder
+    assert client.disconnects == 0
+    assert await client_mod.force_reset_client(reason="again") is True
+    assert client.disconnects == 1
 
 
 async def test_proxy_timeout_restarts_the_backend_without_retrying_the_call(tmp_path, monkeypatch):
@@ -811,7 +905,7 @@ async def test_restart_spawns_only_after_the_old_backend_is_stopped(tmp_path, mo
         order.append("spawn")
 
     monkeypatch.setattr(Relay, "ensure_backend", ensure)
-    await relay._restart_unresponsive_backend()
+    await relay._restart_unresponsive_backend(42)
     assert order == ["kill"]
 
 

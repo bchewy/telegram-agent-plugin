@@ -135,7 +135,9 @@ class Relay:
         # The host's tool_timeout_sec (600 in .mcp.json) has to outlast this
         # wait, or the host returns -32001 before we can report the error.
         host_timeout = _float_env("CODEX_TELEGRAM_HOST_TOOL_TIMEOUT", 600.0)
-        ceiling = host_timeout - 5
+        # terminate_locked_backend waits out SIGTERM (default 8s) after this
+        # deadline. That grace has to land inside the host timeout too.
+        ceiling = host_timeout - 8 - 5
         if ceiling > 0 and self.response_deadline > ceiling:
             _err(
                 f"capping proxy deadline at {ceiling:.0f}s so it stays under "
@@ -215,6 +217,14 @@ class Relay:
         that replacement is left alone.
         """
         _err("backend did not answer within the deadline; restarting it")
+        if expected_pid is None:
+            # This request never identified a backend. Signaling whoever holds
+            # the lock now can kill a replacement a peer already started.
+            try:
+                await self.ensure_backend()
+            except Exception as exc:
+                _err(f"could not start a backend: {exc!r}")
+            return
         try:
             await asyncio.to_thread(
                 terminate_locked_backend,
@@ -271,9 +281,9 @@ class Relay:
             # Report as JSON-RPC errors so the MCP host never hangs on a lost id.
             _err(f"relay error: {exc!r}")
             tool = _tools_call_name(msg)
-            if is_mutating_tool(tool):
-                # The POST may have reached the backend and Telegram. Do not
-                # describe this as a retryable transport blip.
+            if is_mutating_tool(tool) and not isinstance(exc, (httpx.ConnectError, FileNotFoundError)):
+                # ConnectError and a missing socket failed before dispatch.
+                # Anything else may already have been accepted.
                 message = delivery_unknown_message(tool)
             else:
                 message = f"telegram proxy: {exc}"

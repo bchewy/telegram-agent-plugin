@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 _client: TelegramClient | None = None
 _client_lock = asyncio.Lock()
+_generation_seq = 0
 _last_client_verify_monotonic = 0.0
 # Set when a client could not be proven dead. Opening another one would put
 # two MTProto sessions on the same auth key, which Telegram revokes.
@@ -160,6 +161,33 @@ class TelegramUploadError(RuntimeError):
         )
 
 
+def _upload_cleanup_reserve() -> float:
+    """How much of the upload budget is held back for disconnect.
+
+    The process-level disconnect timeout can be larger than the upload
+    budget. Reserving all of it would refuse every transfer, including one
+    on a client that is already connected.
+    """
+    reserve = DISCONNECT_TIMEOUT_SECONDS
+    if reserve <= 0:
+        return 0.0
+    return min(reserve, UPLOAD_TOTAL_BUDGET_SECONDS / 2)
+
+
+def client_generation(client: TelegramClient) -> int:
+    """Monotonic id assigned to a client object. ``id()`` can be reused."""
+    global _generation_seq
+    gen = getattr(client, "_codex_telegram_generation", None)
+    if isinstance(gen, int):
+        return gen
+    _generation_seq += 1
+    try:
+        setattr(client, "_codex_telegram_generation", _generation_seq)
+    except (AttributeError, TypeError):
+        pass
+    return _generation_seq
+
+
 def _upload_timeout_seconds(file_path: Path) -> float:
     """Per-attempt stall timeout, scaled with size and capped for host MCP waits."""
     size = file_path.stat().st_size
@@ -183,6 +211,7 @@ async def upload_with_retry(
     """
     per_attempt = _upload_timeout_seconds(file_path)
     deadline = time.monotonic() + UPLOAD_TOTAL_BUDGET_SECONDS
+    reserve = _upload_cleanup_reserve()
     last_error: BaseException | None = None
     attempts_used = 0
     for attempt in range(1, UPLOAD_ATTEMPTS + 1):
@@ -190,11 +219,15 @@ async def upload_with_retry(
         if remaining <= 0:
             break
         if client is None:
-            # Reconnect spends the same budget as the transfer. Measuring
-            # the allowance before get_client() let a slow connect plus a
-            # full-length retry run well past UPLOAD_TOTAL_BUDGET_SECONDS.
+            # Leave the reserve for get_client's own disconnect if this
+            # wait cancels a connect. wait_for does not return until that
+            # cleanup finishes, so the timeout has to end before the budget.
+            if reserve > 0 and remaining <= reserve:
+                last_error = TimeoutError("upload budget exhausted")
+                break
+            acquire_timeout = remaining - reserve if reserve > 0 else remaining
             try:
-                client = await asyncio.wait_for(get_client(), timeout=remaining)
+                client = await asyncio.wait_for(get_client(), timeout=acquire_timeout)
             except (asyncio.TimeoutError, TimeoutError) as exc:
                 last_error = exc
                 break
@@ -202,17 +235,13 @@ async def upload_with_retry(
             if remaining <= 0:
                 last_error = TimeoutError("upload budget exhausted during reconnect")
                 break
-        # A failed attempt then waits out disconnect, which is up to
-        # DISCONNECT_TIMEOUT_SECONDS. Starting a transfer that leaves less
-        # than that pushes TelegramUploadError past the budget.
-        if (
-            DISCONNECT_TIMEOUT_SECONDS > 0
-            and remaining <= DISCONNECT_TIMEOUT_SECONDS
-        ):
+        # A failed attempt then waits out disconnect. Starting a transfer
+        # that leaves less than the reserve pushes the error past the budget.
+        if reserve > 0 and remaining <= reserve:
             if last_error is None:
                 last_error = TimeoutError("upload budget exhausted")
             break
-        transfer = min(per_attempt, remaining - DISCONNECT_TIMEOUT_SECONDS)
+        transfer = min(per_attempt, remaining - reserve)
         attempts_used = attempt
         try:
             return await asyncio.wait_for(do_upload(client), timeout=transfer)
@@ -354,14 +383,24 @@ async def _await_shutdown(client: TelegramClient, *, context: str) -> None:
     unwinds.
     """
     task = asyncio.current_task()
-    pending = task.cancelling() if task is not None else 0
-    for _ in range(pending):
-        if task is not None:
-            task.uncancel()
+    job = asyncio.create_task(_shutdown_client(client, context=context))
+    drained = False
     try:
-        await _shutdown_client(client, context=context)
+        while not job.done():
+            if task is not None:
+                while task.cancelling():
+                    task.uncancel()
+                    drained = True
+            try:
+                await asyncio.shield(job)
+            except asyncio.CancelledError:
+                # A cancel that arrives during shutdown must not drop the
+                # caller's lock. Keep waiting; the disconnect has its own bound.
+                drained = True
+                continue
+        job.result()
     finally:
-        if pending and task is not None:
+        if drained and task is not None:
             task.cancel()
 
 
@@ -383,7 +422,7 @@ async def _discard_locked(expected: TelegramClient | None = None) -> None:
     # Stop handing the doomed client out before awaiting anything.
     _client = None
     _last_client_verify_monotonic = 0.0
-    await _shutdown_client(client, context="discard")
+    await _await_shutdown(client, context="discard")
 
 
 async def _discard_client(expected: TelegramClient | None = None) -> None:
@@ -411,26 +450,11 @@ async def force_reset_client(*, reason: str) -> bool:
 
     now = time.monotonic()
     current = _client
+    current_gen = client_generation(current) if current is not None else None
     if now - _last_reset_monotonic < RESET_DEBOUNCE_SECONDS and (
-        current is None or id(current) == _debounced_generation
+        current is None or current_gen == _debounced_generation
     ):
         return False
-    _last_reset_monotonic = now
-    if current is not None:
-        _debounced_generation = id(current)
-
-    cutoff = now - RESET_ESCALATE_WINDOW_SECONDS
-    _reset_history.append(now)
-    _reset_history[:] = [stamp for stamp in _reset_history if stamp >= cutoff]
-    # The resets already performed are the entries before this one. Hitting
-    # the cap means in-process recovery is not sticking, so die instead of
-    # connecting yet another client in a loop.
-    if len(_reset_history) > MAX_RESETS_BEFORE_RESTART:
-        _escalate(
-            f"{reason}; {len(_reset_history)} client resets within "
-            f"{RESET_ESCALATE_WINDOW_SECONDS:.0f}s did not stick"
-        )
-        raise ConnectionError("Telegram client kept wedging; the backend is restarting.")
 
     _note(f"resetting telegram client: {reason}")
     try:
@@ -453,6 +477,22 @@ async def force_reset_client(*, reason: str) -> bool:
             await _discard_locked(current)
     finally:
         _client_lock.release()
+
+    # Stamp only after the client is actually retired. A reset cancelled
+    # while it waited on the lock must not suppress the next one.
+    finished = time.monotonic()
+    _last_reset_monotonic = finished
+    if current_gen is not None:
+        _debounced_generation = current_gen
+    cutoff = finished - RESET_ESCALATE_WINDOW_SECONDS
+    _reset_history.append(finished)
+    _reset_history[:] = [stamp for stamp in _reset_history if stamp >= cutoff]
+    if len(_reset_history) > MAX_RESETS_BEFORE_RESTART:
+        _escalate(
+            f"{reason}; {len(_reset_history)} client resets within "
+            f"{RESET_ESCALATE_WINDOW_SECONDS:.0f}s did not stick"
+        )
+        raise ConnectionError("Telegram client kept wedging; the backend is restarting.")
     return True
 
 
@@ -550,6 +590,7 @@ async def get_client() -> TelegramClient:
             raise
 
         _client = client
+        client_generation(client)
         _last_client_verify_monotonic = time.monotonic()
         return _client
 

@@ -171,11 +171,27 @@ async def test_total_budget_returns_error_before_host_timeout(upload_file, retry
     assert isinstance(excinfo.value.__cause__, TimeoutError)
 
 
+async def test_a_disconnect_timeout_as_large_as_the_budget_still_uploads(upload_file, retry_env, monkeypatch):
+    monkeypatch.setattr(client_mod, "UPLOAD_TOTAL_BUDGET_SECONDS", 1.0)
+    monkeypatch.setattr(client_mod, "DISCONNECT_TIMEOUT_SECONDS", 70.0)
+    monkeypatch.setattr(client_mod, "_upload_timeout_seconds", lambda _path: 10.0)
+    seen = []
+
+    async def do_upload(_client):
+        seen.append(1)
+        return "sent"
+
+    result = await upload_with_retry(do_upload, file_path=upload_file, tool_name="send_video")
+    assert result == "sent"
+    assert seen == [1]
+
+
 async def test_reconnect_time_counts_against_the_upload_budget(upload_file, monkeypatch):
     """The allowance is what is left after get_client returns, not before it."""
     monkeypatch.setattr(client_mod, "UPLOAD_TOTAL_BUDGET_SECONDS", 1.0)
-    monkeypatch.setattr(client_mod, "UPLOAD_ATTEMPTS", 2)
+    monkeypatch.setattr(client_mod, "DISCONNECT_TIMEOUT_SECONDS", 0.05)
     monkeypatch.setattr(client_mod, "_upload_timeout_seconds", lambda _path: 10.0)
+    started_upload = []
 
     async def slow_get_client():
         await asyncio.sleep(0.8)
@@ -188,14 +204,16 @@ async def test_reconnect_time_counts_against_the_upload_budget(upload_file, monk
     monkeypatch.setattr(client_mod, "_discard_client", discard)
 
     async def do_upload(_client):
+        started_upload.append(1)
         await asyncio.Future()
 
     started = asyncio.get_running_loop().time()
-    with pytest.raises(TelegramUploadError) as excinfo:
+    with pytest.raises(TelegramDeliveryUnknown) as excinfo:
         await upload_with_retry(do_upload, file_path=upload_file, tool_name="send_video")
     elapsed = asyncio.get_running_loop().time() - started
     # 0.8s reconnect plus the leftover slice of the 1s budget. Charging the
     # full pre-reconnect remainder on top would land near 1.8s.
+    assert started_upload == [1]
     assert elapsed < 1.4
     assert isinstance(excinfo.value.__cause__, TimeoutError)
 
