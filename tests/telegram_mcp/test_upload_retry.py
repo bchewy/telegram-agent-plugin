@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from codex_telegram import client as client_mod
-from codex_telegram.client import TelegramUploadError, upload_with_retry
+from codex_telegram.client import TelegramDeliveryUnknown, TelegramUploadError, upload_with_retry
 from codex_telegram.tools import media
 
 
@@ -40,41 +40,38 @@ def retry_env(monkeypatch):
     return state
 
 
-async def test_succeeds_on_later_attempt_after_connection_errors(upload_file, retry_env):
-    failures = [ConnectionResetError("peer reset")]
-    attempts = []
-
-    async def do_upload(client):
-        attempts.append(client)
-        if failures:
-            raise failures.pop(0)
-        return "sent"
-
-    result = await upload_with_retry(do_upload, file_path=upload_file, tool_name="send_video")
-
-    assert result == "sent"
-    assert len(attempts) == 2
-    assert retry_env.discards == 1
-    assert retry_env.sleeps == [1.0]
-
-
-async def test_exhausted_retries_fail_fast_with_clear_error(upload_file, retry_env):
+async def test_connection_error_after_the_send_is_not_retried(upload_file, retry_env):
     attempts = []
 
     async def do_upload(client):
         attempts.append(client)
         raise ConnectionResetError("peer reset")
 
-    with pytest.raises(TelegramUploadError) as excinfo:
+    with pytest.raises(TelegramDeliveryUnknown, match="delivery unknown") as excinfo:
         await upload_with_retry(do_upload, file_path=upload_file, tool_name="send_video")
 
-    assert len(attempts) == client_mod.UPLOAD_ATTEMPTS
-    assert retry_env.discards == client_mod.UPLOAD_ATTEMPTS
+    assert len(attempts) == 1
+    assert retry_env.discards == 1
+    assert retry_env.sleeps == []
+    assert isinstance(excinfo.value.__cause__, ConnectionResetError)
+
+
+async def test_exhausted_send_reports_delivery_unknown(upload_file, retry_env):
+    attempts = []
+
+    async def do_upload(client):
+        attempts.append(client)
+        raise ConnectionResetError("peer reset")
+
+    with pytest.raises(TelegramDeliveryUnknown) as excinfo:
+        await upload_with_retry(do_upload, file_path=upload_file, tool_name="send_video")
+
+    assert len(attempts) == 1
+    assert retry_env.discards == 1
     message = str(excinfo.value)
     assert "send_video" in message
-    assert "video.mp4" in message
-    assert f"after {client_mod.UPLOAD_ATTEMPTS} attempts" in message
-    assert "ConnectionResetError" in message
+    assert "delivery unknown" in message
+    assert "not retried" in message
     assert isinstance(excinfo.value.__cause__, ConnectionResetError)
 
 
@@ -103,33 +100,31 @@ async def test_stalled_upload_times_out_and_retries(upload_file, retry_env, monk
         # the per-attempt timeout must convert that hang into a retry.
         await asyncio.Future()
 
-    with pytest.raises(TelegramUploadError) as excinfo:
+    with pytest.raises(TelegramDeliveryUnknown, match="delivery unknown") as excinfo:
         await upload_with_retry(do_upload, file_path=upload_file, tool_name="send_document")
 
-    assert len(attempts) == client_mod.UPLOAD_ATTEMPTS
+    assert len(attempts) == 1
     assert isinstance(excinfo.value.__cause__, TimeoutError)
 
 
-async def test_retries_use_a_fresh_client_after_discard(upload_file, retry_env):
+async def test_a_failed_send_discards_that_client_and_is_not_repeated(upload_file, retry_env):
     initial_client = SimpleNamespace(name="initial")
     seen = []
 
     async def do_upload(client):
         seen.append(client)
-        if len(seen) == 1:
-            raise ConnectionResetError("peer reset")
-        return "sent"
+        raise ConnectionResetError("peer reset")
 
-    result = await upload_with_retry(
-        do_upload,
-        file_path=upload_file,
-        tool_name="send_photo",
-        client=initial_client,
-    )
+    with pytest.raises(TelegramDeliveryUnknown):
+        await upload_with_retry(
+            do_upload,
+            file_path=upload_file,
+            tool_name="send_photo",
+            client=initial_client,
+        )
 
-    assert result == "sent"
-    assert seen[0] is initial_client
-    assert seen[1] is retry_env.fresh_clients[0]
+    assert seen == [initial_client]
+    assert retry_env.fresh_clients == []
     assert retry_env.discards == 1
 
 
@@ -168,10 +163,11 @@ async def test_total_budget_returns_error_before_host_timeout(upload_file, retry
         # stubbed by retry_env, so wait on a future the timeout can cancel.
         await asyncio.Future()
 
-    with pytest.raises(TelegramUploadError) as excinfo:
+    with pytest.raises(TelegramDeliveryUnknown) as excinfo:
         await upload_with_retry(do_upload, file_path=upload_file, tool_name="send_video")
 
-    assert len(attempts) == 1  # budget exhausted after the first stall
+    assert len(attempts) == 1  # the send was issued once
+    assert "delivery unknown" in str(excinfo.value)
     assert isinstance(excinfo.value.__cause__, TimeoutError)
 
 
@@ -256,9 +252,8 @@ async def test_send_video_recovers_from_mid_upload_connection_drop(
     )
     monkeypatch.setattr(media, "message_to_dict", lambda message: {"id": message.id})
 
-    result = await send_video(chat_ref="@friend", file_path=str(upload_file))
+    with pytest.raises(TelegramDeliveryUnknown, match="delivery unknown"):
+        await send_video(chat_ref="@friend", file_path=str(upload_file))
 
-    assert result == {"id": 99}
-    assert len(send_file_calls) == 2
+    assert len(send_file_calls) == 1
     assert retry_env.discards == 1
-    assert send_file_calls[1][2]["supports_streaming"] is True

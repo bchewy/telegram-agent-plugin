@@ -26,6 +26,7 @@ import time
 import httpx
 
 from . import limits
+from .delivery import delivery_unknown_message, is_mutating_tool
 from .legacy_serve import kill_legacy_serves, parent_gone, reap_orphaned_proxies, register_proxy
 from .runtime_paths import backend_lock_path, backend_log_path, backend_socket_path, config_dir
 from .supervision import locked_backend_pid, terminate_locked_backend
@@ -131,6 +132,16 @@ class Relay:
         self.response_deadline = (
             limits.TOOL_CALL_TIMEOUT_SECONDS + limits.BACKEND_RESPONSE_GRACE_SECONDS
         )
+        # The host's tool_timeout_sec (600 in .mcp.json) has to outlast this
+        # wait, or the host returns -32001 before we can report the error.
+        host_timeout = _float_env("CODEX_TELEGRAM_HOST_TOOL_TIMEOUT", 600.0)
+        ceiling = host_timeout - 5
+        if ceiling > 0 and self.response_deadline > ceiling:
+            _err(
+                f"capping proxy deadline at {ceiling:.0f}s so it stays under "
+                f"the host tool timeout ({host_timeout:.0f}s)"
+            )
+            self.response_deadline = ceiling
         self.out_lock = asyncio.Lock()
         self.start_lock = asyncio.Lock()
 
@@ -259,14 +270,32 @@ class Relay:
         except Exception as exc:
             # Report as JSON-RPC errors so the MCP host never hangs on a lost id.
             _err(f"relay error: {exc!r}")
+            tool = _tools_call_name(msg)
+            if is_mutating_tool(tool):
+                # The POST may have reached the backend and Telegram. Do not
+                # describe this as a retryable transport blip.
+                message = delivery_unknown_message(tool)
+            else:
+                message = f"telegram proxy: {exc}"
             for request_id in ids:
                 await self.write(
                     {
                         "jsonrpc": "2.0",
                         "id": request_id,
-                        "error": {"code": -32603, "message": f"telegram proxy: {exc}"},
+                        "error": {"code": -32603, "message": message},
                     }
                 )
+
+
+def _tools_call_name(msg) -> str | None:
+    items = msg if isinstance(msg, list) else [msg]
+    for item in items:
+        if not isinstance(item, dict) or item.get("method") != "tools/call":
+            continue
+        params = item.get("params")
+        if isinstance(params, dict) and isinstance(params.get("name"), str):
+            return params["name"]
+    return None
 
 
 async def _watch_parent(parent: int, stop: asyncio.Event) -> None:

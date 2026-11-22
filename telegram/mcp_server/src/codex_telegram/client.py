@@ -16,6 +16,7 @@ from telethon import TelegramClient, errors, functions
 from telethon.sessions import StringSession
 
 from . import __version__
+from .delivery import delivery_unknown_message
 from .proxy import mtproxy_client_kwargs
 from .session_store import MissingSessionError, load_session
 
@@ -117,19 +118,28 @@ DEFAULT_TAKEOUT_KWARGS = {
 }
 
 
-# Media uploads over flaky links (observed with MTProxy) can drop mid-transfer
-# with BrokenPipe/ConnectionReset, after which Telethon reconnect-loops and the
-# original request never resolves. Host MCP clients then kill the stream with
-# -32001 before any tool error returns (seen at ~60–140s). Retry the whole
-# upload on a fresh connection, but keep the total wall-clock budget under
-# UPLOAD_TOTAL_BUDGET_SECONDS so TelegramUploadError reaches the caller as a
-# real tool error instead of a host timeout.
-UPLOAD_ATTEMPTS = 2
-UPLOAD_RETRY_BACKOFF_SECONDS = (1.0,)
+# Once ``do_upload`` is entered, a drop or a stall means Telegram may already
+# have accepted the file. A second attempt would deliver it twice, so the
+# call fails with delivery unknown instead of retrying. The budget still
+# bounds how long that single attempt may hang.
+UPLOAD_ATTEMPTS = 1
+UPLOAD_RETRY_BACKOFF_SECONDS = ()
 UPLOAD_BASE_TIMEOUT_SECONDS = 20.0
 UPLOAD_MIN_BYTES_PER_SECOND = 128 * 1024
 UPLOAD_MAX_ATTEMPT_TIMEOUT_SECONDS = 40.0
 UPLOAD_TOTAL_BUDGET_SECONDS = 70.0
+
+
+class TelegramDeliveryUnknown(RuntimeError):
+    """The RPC was issued and the reply was never observed.
+
+    FastMCP stringifies tool exceptions, so the message is the whole signal
+    the caller gets: delivery is unknown and the call was not repeated.
+    """
+
+    def __init__(self, *, tool_name: str, cause: BaseException):
+        self.tool_name = tool_name
+        super().__init__(f"{delivery_unknown_message(tool_name)} ({type(cause).__name__}: {cause})")
 
 
 class TelegramUploadError(RuntimeError):
@@ -164,13 +174,12 @@ async def upload_with_retry(
     tool_name: str,
     client: TelegramClient | None = None,
 ) -> R:
-    """Run ``do_upload(client)`` with retries on connection drops and stalls.
+    """Run ``do_upload(client)`` once. A drop after it starts is not retried.
 
-    Each failed attempt discards the shared client so the next attempt starts
-    from a fresh connection instead of a reconnect-looping one. Non-connection
-    errors (FloodWait, bad arguments, ...) propagate immediately. The whole
-    loop is bounded by ``UPLOAD_TOTAL_BUDGET_SECONDS`` so a dead proxy returns
-    ``TelegramUploadError`` before the MCP host cancels the stream.
+    A connection drop or a stall after ``do_upload`` starts is delivery
+    unknown: Telegram may already have the file, so there is no second
+    attempt. Non-connection errors (FloodWait, bad arguments, ...) propagate
+    immediately. The attempt is bounded by ``UPLOAD_TOTAL_BUDGET_SECONDS``.
     """
     per_attempt = _upload_timeout_seconds(file_path)
     deadline = time.monotonic() + UPLOAD_TOTAL_BUDGET_SECONDS
@@ -208,20 +217,13 @@ async def upload_with_retry(
         try:
             return await asyncio.wait_for(do_upload(client), timeout=transfer)
         except (ConnectionError, TimeoutError) as exc:
-            last_error = exc
             failed = client
             client = None
             # Holds the client lock until disconnect finishes, so a concurrent
             # get_client cannot dial a second session on the same auth key.
+            # The send itself is not repeated.
             await _discard_client(failed)
-            if attempt < UPLOAD_ATTEMPTS:
-                backoff = UPLOAD_RETRY_BACKOFF_SECONDS[
-                    min(attempt - 1, len(UPLOAD_RETRY_BACKOFF_SECONDS) - 1)
-                ]
-                # Don't sleep past the budget; fall through to the error.
-                if time.monotonic() + backoff >= deadline:
-                    break
-                await asyncio.sleep(backoff)
+            raise TelegramDeliveryUnknown(tool_name=tool_name, cause=exc) from exc
     if last_error is None:
         last_error = TimeoutError("upload budget exhausted")
     raise TelegramUploadError(
@@ -440,7 +442,15 @@ async def force_reset_client(*, reason: str) -> bool:
         )
         raise ConnectionError("Telegram client lock is stuck; the backend is restarting.")
     try:
-        await _discard_locked()
+        if current is None:
+            # Nothing was published when the reset was requested. The connect
+            # that held the lock has since published its client; that client
+            # is what this reset is waiting out.
+            await _discard_locked()
+        else:
+            # Only the client we decided to reset. A replacement published
+            # while this waited on the lock is a different object and stays up.
+            await _discard_locked(current)
     finally:
         _client_lock.release()
     return True

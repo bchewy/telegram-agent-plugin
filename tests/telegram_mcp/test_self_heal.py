@@ -317,6 +317,30 @@ async def test_wedged_tool_call_errors_inside_the_timeout_and_resets(monkeypatch
     assert elapsed < 2
     assert wedged.disconnects == 1
     assert wedged._sender._state.time_offset == 0
+
+
+async def test_a_timed_out_send_is_issued_once_and_says_delivery_unknown(monkeypatch):
+    _arm(monkeypatch)
+    monkeypatch.setattr(limits, "TOOL_CALL_TIMEOUT_SECONDS", 0.2)
+    calls = []
+
+    class _Manager:
+        async def call_tool(self, name, arguments, *args, **kwargs):
+            calls.append(name)
+            await asyncio.Future()
+
+    class _MCP:
+        _tool_manager = _Manager()
+
+    mcp = _MCP()
+    install_tool_call_guard(mcp)
+
+    with pytest.raises(RuntimeError, match="delivery unknown") as excinfo:
+        await mcp._tool_manager.call_tool("send_message", {})
+
+    assert calls == ["send_message"]
+    assert "not retried" in str(excinfo.value)
+    assert "retry." not in str(excinfo.value).lower()
     assert client_mod._client is None
     # The wrapper released its in-flight entry, so the watchdog does not see
     # a call that already returned.
@@ -539,6 +563,42 @@ def test_repeated_resets_escalate_instead_of_looping(monkeypatch):
     assert "did not stick" in reasons[-1]
 
 
+async def test_reset_does_not_discard_a_client_published_while_it_waited(monkeypatch):
+    """The reset captured client A. B was installed before the lock was free.
+    B must still be the live client when the reset runs."""
+    _arm(monkeypatch)
+    old = _Client()
+    old.connected = True
+    client_mod._client = old
+    fresh = _Client()
+    fresh.connected = True
+    release = asyncio.Event()
+
+    async def hold():
+        await client_mod._client_lock.acquire()
+        try:
+            await release.wait()
+            client_mod._client = fresh
+        finally:
+            client_mod._client_lock.release()
+
+    holder = asyncio.create_task(hold())
+    for _ in range(50):
+        if client_mod._client_lock.locked():
+            break
+        await asyncio.sleep(0.01)
+    resetting = asyncio.create_task(client_mod.force_reset_client(reason="storm"))
+    await asyncio.sleep(0.05)
+    assert not resetting.done()
+    release.set()
+    assert await resetting is True
+    await holder
+    assert fresh.disconnects == 0
+    assert fresh.connected
+    assert client_mod.current_client() is fresh
+    assert old.disconnects == 0
+
+
 async def test_debounce_does_not_spare_a_client_connected_after_the_reset(monkeypatch):
     _arm(monkeypatch, debounce=30.0)
     first = _Client()
@@ -600,6 +660,29 @@ def test_reap_kills_only_orphaned_proxies(monkeypatch, tmp_path):
     assert "77" in dropped
 
 
+def test_reap_refuses_a_reused_pid_with_a_different_start_time(monkeypatch, tmp_path):
+    killed = []
+    monkeypatch.setenv("CODEX_TELEGRAM_CONFIG_DIR", str(tmp_path))
+    registry = tmp_path / "run" / "proxies"
+    registry.mkdir(parents=True)
+    (registry / "10").write_text("10 111\n", encoding="ascii")
+    monkeypatch.setattr(legacy_serve, "registered_proxy_pids", lambda: {10})
+    monkeypatch.setattr(legacy_serve, "_self_and_ancestors", lambda: set())
+    monkeypatch.setattr(legacy_serve, "_parent_pid", lambda _pid: 1)
+    monkeypatch.setattr(legacy_serve, "_pid_is_live", lambda _pid: False)
+    monkeypatch.setattr(
+        legacy_serve,
+        "_read_cmdline",
+        lambda _pid: ["python", "-m", "codex_telegram", "serve"],
+    )
+    monkeypatch.setattr(legacy_serve, "process_start_token", lambda _pid: "222")
+    monkeypatch.setattr(legacy_serve.os, "kill", lambda pid, _sig: killed.append(pid))
+
+    assert legacy_serve.reap_orphaned_proxies() == []
+    assert killed == []
+    assert not (registry / "10").exists()
+
+
 def test_parent_gone_tracks_reparent_and_zombies(monkeypatch):
     monkeypatch.delenv("CODEX_TELEGRAM_ALLOW_ORPHAN", raising=False)
     monkeypatch.setattr(legacy_serve.os, "getppid", lambda: 1)
@@ -618,11 +701,12 @@ def test_parent_gone_tracks_reparent_and_zombies(monkeypatch):
     monkeypatch.setattr(legacy_serve, "_pid_is_live", lambda _pid: True)
     assert legacy_serve.parent_gone(50) is False
 
-    # No procfs (macOS). A live parent whose pid still matches must not look
-    # dead just because /proc/<pid>/stat cannot be read.
+    # No procfs (macOS). Existence is kill(pid, 0), not a missing /proc record.
     monkeypatch.setattr(legacy_serve.os.path, "isdir", lambda _path: False)
-    monkeypatch.setattr(legacy_serve, "_pid_is_live", lambda _pid: False)
+    monkeypatch.setattr(legacy_serve, "_posix_pid_exists", lambda _pid: True)
     assert legacy_serve.parent_gone(50) is False
+    monkeypatch.setattr(legacy_serve, "_posix_pid_exists", lambda _pid: False)
+    assert legacy_serve.parent_gone(50) is True
 
 
 def test_terminate_refuses_to_signal_a_non_backend(monkeypatch, tmp_path):
@@ -655,6 +739,19 @@ def test_terminate_sigkills_a_backend_that_ignores_sigterm(monkeypatch, tmp_path
     monkeypatch.setattr(supervision.os, "kill", kill)
     assert supervision.terminate_locked_backend(lock, grace=0.2) is True
     assert signals == [signal.SIGTERM, signal.SIGKILL]
+
+
+def test_terminate_refuses_a_reused_pid_with_a_different_start_time(monkeypatch, tmp_path):
+    lock = tmp_path / "backend.lock"
+    lock.write_text("99 111\n")
+    signals = []
+    monkeypatch.setattr(supervision, "pid_alive", lambda _pid: True)
+    monkeypatch.setattr(supervision, "is_backend_process", lambda _pid: True)
+    monkeypatch.setattr(supervision, "process_start_token", lambda _pid: "222")
+    monkeypatch.setattr(supervision.os, "kill", lambda pid, sig: signals.append((pid, sig)))
+    with pytest.raises(RuntimeError, match="start time"):
+        supervision.terminate_locked_backend(lock)
+    assert signals == []
 
 
 def test_terminate_does_not_kill_a_replacement_backend(monkeypatch, tmp_path):

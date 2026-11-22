@@ -35,6 +35,7 @@ import signal
 from pathlib import Path
 
 from .runtime_paths import config_dir, proxy_registry_dir
+from .supervision import process_start_token
 from .session_store import CONFIG_DIR_ENV_VAR
 
 STARTUP_GRACE_SECONDS = 10.0
@@ -137,7 +138,8 @@ def is_uv_serve_wrapper_cmdline(cmdline: list[str] | None) -> bool:
 def register_proxy() -> Path:
     """Record this process in the proxy registry so sweeps never target it."""
     path = proxy_registry_dir() / str(os.getpid())
-    path.write_text(f"{os.getpid()}\n", encoding="ascii")
+    token = process_start_token(os.getpid()) or "-"
+    path.write_text(f"{os.getpid()} {token}\n", encoding="ascii")
     atexit.register(lambda: path.unlink(missing_ok=True))
     return path
 
@@ -168,8 +170,9 @@ def parent_gone(original_ppid: int) -> bool:
     an orphan too. Set ``CODEX_TELEGRAM_ALLOW_ORPHAN=1`` to keep a serve that
     was started detached on purpose.
 
-    Without ``/proc`` (macOS), a parent whose pid still matches is treated as
-    alive. Zombie detection needs procfs; stdin EOF still ends the serve.
+    Without ``/proc`` (macOS), a matching ppid is checked with ``kill(pid, 0)``.
+    A missing procfs record is not a dead parent. Zombie detection still
+    needs procfs; stdin EOF still ends the serve.
     """
     if os.getenv("CODEX_TELEGRAM_ALLOW_ORPHAN", "").strip().lower() in {
         "1",
@@ -184,11 +187,25 @@ def parent_gone(original_ppid: int) -> bool:
     if current != original_ppid:
         return True
     if not os.path.isdir("/proc"):
-        # macOS and anything else without procfs. A missing /proc record is
-        # not a dead parent; the ppid comparison above is the check we have.
-        # stdin EOF still ends a serve whose host closed the pipe.
-        return False
+        # macOS has no procfs. ``kill(pid, 0)`` is the existence check; a
+        # missing /proc record must not look like a dead parent. Zombie
+        # detection still needs /proc, and stdin EOF still ends the serve.
+        return not _posix_pid_exists(original_ppid)
     return not _pid_is_live(original_ppid)
+
+
+def _posix_pid_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def reap_orphaned_proxies(*, log=None) -> list[int]:
@@ -216,6 +233,12 @@ def reap_orphaned_proxies(*, log=None) -> list[int]:
         if not is_direct_serve_cmdline(_read_cmdline(pid)):
             (proxy_registry_dir() / str(pid)).unlink(missing_ok=True)
             continue
+        recorded = _registered_start_token(pid)
+        if recorded is not None and process_start_token(pid) != recorded:
+            # The pid was reused. The command line can match a new serve
+            # that has not registered yet; the start token cannot.
+            (proxy_registry_dir() / str(pid)).unlink(missing_ok=True)
+            continue
         # The opt-out belongs to the process we would signal, not to us.
         if _process_allows_orphan(pid):
             continue
@@ -241,6 +264,15 @@ def _process_allows_orphan(pid: int) -> bool:
             value = entry[len(prefix):].decode("utf-8", "replace").strip().lower()
             return value in {"1", "true", "yes", "on"}
     return False
+
+
+def _registered_start_token(pid: int) -> str | None:
+    """Start token recorded at registration. None for a pid-only entry."""
+    try:
+        parts = (proxy_registry_dir() / str(pid)).read_text(encoding="ascii").split()
+    except OSError:
+        return None
+    return parts[1] if len(parts) > 1 else None
 
 
 def registered_proxy_pids() -> set[int]:

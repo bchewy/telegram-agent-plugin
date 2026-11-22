@@ -38,6 +38,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from .health import start_self_heal, watchdog_loop
 from .runtime_paths import backend_lock_path, backend_socket_path
+from .supervision import process_start_token
 from .server import mcp
 
 try:
@@ -76,15 +77,18 @@ def acquire_backend_lock(lock_path: Path) -> int | None:
         os.close(fd)
         return None
     os.ftruncate(fd, 0)
-    os.write(fd, f"{os.getpid()}\n".encode("ascii"))
+    # Second field is the process start token. A reused pid fails the match
+    # in terminate_locked_backend even if its command line looks like ours.
+    token = process_start_token(os.getpid()) or "-"
+    os.write(fd, f"{os.getpid()} {token}\n".encode("ascii"))
     return fd
 
 
 def read_backend_pid(lock_path: Path) -> int | None:
     """Best-effort pid of the lock-holding backend (for diagnostics/tests)."""
     try:
-        return int(lock_path.read_text(encoding="ascii").strip())
-    except (OSError, ValueError):
+        return int(lock_path.read_text(encoding="ascii").split()[0])
+    except (OSError, ValueError, IndexError):
         return None
 
 

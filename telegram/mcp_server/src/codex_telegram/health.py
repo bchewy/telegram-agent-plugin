@@ -27,6 +27,7 @@ import time
 from telethon import functions
 
 from . import limits
+from .delivery import delivery_unknown_message, is_mutating_tool
 from .client import (
     _escalate,
     _note,
@@ -182,6 +183,8 @@ def install_tool_call_guard(mcp) -> None:
             # Drop the wedged sender before telling the caller to retry, so
             # the retry lands on a fresh client instead of the same black hole.
             await force_reset_client(reason=f"tool {name!r} exceeded {timeout:.0f}s")
+            if is_mutating_tool(name):
+                raise RuntimeError(delivery_unknown_message(name)) from exc
             raise RuntimeError(
                 f"{name} timed out after {timeout:.0f}s because the Telegram "
                 "connection stopped delivering replies. The connection was "
@@ -195,6 +198,8 @@ def install_tool_call_guard(mcp) -> None:
             # task itself (the host dropped the HTTP request) still propagates.
             if _task_is_cancelling():
                 raise
+            if is_mutating_tool(name):
+                raise ConnectionError(delivery_unknown_message(name))
             raise ConnectionError(
                 f"{name} was cancelled because the Telegram connection was "
                 "reset. Retry."

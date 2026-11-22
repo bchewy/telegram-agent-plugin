@@ -16,11 +16,39 @@ import time
 _BACKEND_ARGV_TAIL = (b"-m", b"codex_telegram", b"backend")
 
 
-def _read_lock_pid(lock_path: Path) -> int | None:
+def _read_lock_record(lock_path: Path) -> tuple[int | None, str | None]:
+    """Pid and start token. The token is absent on locks written before it existed."""
     try:
-        return int(lock_path.read_text(encoding="ascii").strip())
-    except (OSError, ValueError):
+        parts = lock_path.read_text(encoding="ascii").split()
+    except OSError:
+        return None, None
+    if not parts:
+        return None, None
+    try:
+        pid = int(parts[0])
+    except ValueError:
+        return None, None
+    token = parts[1] if len(parts) > 1 else None
+    return pid, token
+
+
+def _read_lock_pid(lock_path: Path) -> int | None:
+    pid, _token = _read_lock_record(lock_path)
+    return pid
+
+
+def process_start_token(pid: int) -> str | None:
+    """proc(5) starttime (field 22). Stable for the life of that pid."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii", errors="replace")
+    except OSError:
         return None
+    _pid, _comm, tail = stat.rpartition(")")
+    fields = tail.split()
+    # field 3 is index 0; field 22 is index 19.
+    if len(fields) < 20:
+        return None
+    return fields[19]
 
 
 def _proc_state(pid: int) -> str | None:
@@ -90,7 +118,7 @@ def terminate_locked_backend(
     still alive after SIGKILL. Returns only once the old process can no longer
     hold an MTProto session.
     """
-    pid = _read_lock_pid(lock_path)
+    pid, token = _read_lock_record(lock_path)
     if expected_pid is not None and pid != expected_pid:
         return False
     if pid is None or pid <= 0 or not pid_alive(pid):
@@ -100,6 +128,13 @@ def terminate_locked_backend(
             f"refusing to signal pid {pid}: its command line is not a "
             "codex_telegram backend"
         )
+    if token is not None:
+        live = process_start_token(pid)
+        if live != token:
+            raise RuntimeError(
+                f"refusing to signal pid {pid}: its start time does not match "
+                "the backend lock"
+            )
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:

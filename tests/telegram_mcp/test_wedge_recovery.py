@@ -118,6 +118,14 @@ SITECUSTOMIZE = textwrap.dedent(
             await self._maybe_wedge()
             return types.NearestDc(nearest_dc=1, country="US", this_dc=1)
 
+        async def get_entity(self, ref):
+            return types.PeerUser(1)
+
+        async def send_message(self, entity, message, **kwargs):
+            _append("sends", "1")
+            await self._maybe_wedge()
+            return types.Message(id=1, peer_id=types.PeerUser(1), message=message)
+
         async def get_me(self):
             if _mode() == "storm":
                 log = logging.getLogger("telethon.network.mtprotosender")
@@ -370,6 +378,54 @@ def test_security_error_storm_resets_the_client(wedge_env):
         builds = (marker / "builds").read_text(encoding="ascii").split()
         if len(builds) < 2:
             _fail(config, stderr_path, f"storm did not build a replacement client: {builds}")
+    finally:
+        proxy.close()
+
+
+def test_a_send_during_a_forced_reset_is_delivered_at_most_once(wedge_env):
+    env, config, marker, stderr_path = wedge_env
+    proxy = _Proxy(env, stderr_path)
+    try:
+        _initialize(proxy)
+        (backend_pid,) = _backend_pids(config)
+        _set_mode(marker, "hang")
+        started = time.monotonic()
+        reply = proxy.rpc(
+            2,
+            "tools/call",
+            {"name": "send_message", "arguments": {"chat_ref": "me", "text": "once"}},
+            timeout=CALL_BOUND_SECONDS,
+        )
+        elapsed = time.monotonic() - started
+        if not _is_error(reply) or elapsed >= CALL_BOUND_SECONDS:
+            _fail(
+                config,
+                stderr_path,
+                f"wedged send did not error inside {CALL_BOUND_SECONDS:.0f}s "
+                f"(elapsed={elapsed:.2f}s): {_brief(reply)}",
+            )
+        brief = _brief(reply)
+        if "delivery unknown" not in brief:
+            _fail(config, stderr_path, f"send error does not say delivery unknown: {brief}")
+        sends = (marker / "sends").read_text(encoding="ascii").split() if (marker / "sends").exists() else []
+        print(f"SMOKE wedged send returned in {elapsed:.2f}s: {brief}")
+        print(f"SMOKE send_message invocations: {len(sends)}")
+        if len(sends) != 1:
+            _fail(config, stderr_path, f"send was issued {len(sends)} times: {sends}")
+
+        _set_mode(marker, "ok")
+        recovered = proxy.rpc(3, "tools/call", {"name": "get_me", "arguments": {}})
+        if _is_error(recovered) or "stub_user" not in json.dumps(recovered):
+            _fail(config, stderr_path, f"get_me after the send reset failed: {_brief(recovered)}")
+        print("SMOKE get_me after send reset: stub_user")
+        live, peak = _census(marker)
+        print(f"SMOKE max concurrent MTProto clients during send reset: {peak}")
+        if peak != 1 or live != 1:
+            _fail(config, stderr_path, f"client overlap during send reset: live={live} peak={peak}")
+        if _backend_pids(config) != [backend_pid]:
+            _fail(config, stderr_path, "send reset replaced the backend process")
+        if (marker / "sends").read_text(encoding="ascii").split() != ["1"]:
+            _fail(config, stderr_path, "recovery issued another send")
     finally:
         proxy.close()
 
